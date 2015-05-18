@@ -1017,21 +1017,37 @@ class Db
 
     tbl = Rex::Ui::Text::Table.new(tbl_opts)
 
-    ::ActiveRecord::Base.connection_pool.with_connection {
-      query = Metasploit::Credential::Core.where( workspace_id: framework.db.workspace )
-      query = query.includes(:private, :public, :logins)
-      query = query.includes(logins: [ :service, { service: :host } ])
+    ::ActiveRecord::Base.connection_pool.with_connection do
+      # query = Metasploit::Credential::Core.where( workspace_id: framework.db.workspace )
+      # query = query.includes(:private, :public, :logins)
+      # query = query.includes(logins: [ :service, { service: :host } ])
+      join_sources = []
+      left_join = Arel::Nodes::OuterJoin
+      credential_cores = Metasploit::Credential::Core.arel_table
+      credential_logins = Metasploit::Credential::Login.arel_table
+      credential_publics = Metasploit::Credential::Public.arel_table
+      credential_privates = Metasploit::Credential::Private.arel_table
+      hosts = Mdm::Host.arel_table
+      services = Mdm::Service.arel_table
+
+      join_sources << credential_cores.join(credential_privates, left_join).on(credential_cores[:private_id].eq(credential_privates[:id])).join_sources
+      join_sources << credential_cores.join(credential_publics, left_join).on(credential_cores[:public_id].eq(credential_publics[:id])).join_sources
+      join_sources << credential_cores.join(credential_logins, left_join).on(credential_cores[:id].eq(credential_logins[:core_id])).join_sources
+      join_sources << credential_logins.join(services, left_join).on(credential_logins[:service_id].eq(services[:id])).join_sources
+      join_sources << services.join(hosts, left_join).on(services[:host_id].eq(hosts[:id])).join_sources
+
+      query = Metasploit::Credential::Core.joins(join_sources).where( workspace_id: framework.db.workspace )
 
       if type.present?
         query = query.where(metasploit_credential_privates: { type: type })
       end
 
       if svcs.present?
-        query = query.where(Mdm::Service[:name].in(svcs))
+        query = query.where(services[:name].in(svcs))
       end
 
       if ports.present?
-        query = query.where(Mdm::Service[:port].in(ports))
+        query = query.where(services[:port].in(ports))
       end
 
       if user.present?
@@ -1117,7 +1133,7 @@ class Db
       # of hosts to go into RHOSTS.
       set_rhosts_from_addrs(rhosts.uniq) if set_rhosts
       print_status("Deleted #{delete_count} creds") if delete_count > 0
-    }
+    end
   end
 
   #

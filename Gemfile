@@ -3,6 +3,12 @@ source 'https://rubygems.org'
 #   spec.add_runtime_dependency '<name>', [<version requirements>]
 gemspec name: 'metasploit-framework'
 
+# Metasploit::Concern hooks
+gem 'metasploit-concern', github: 'crmaxx/metasploit-concern', branch: 'staging/rails-4.2'
+# Things that would normally be part of the database model, but which
+# are needed when there's no database
+gem 'metasploit-model', github: 'crmaxx/metasploit-model', branch: 'staging/rails-4.2'
+
 # separate from test as simplecov is not run on travis-ci
 group :coverage do
   # code coverage for tests
@@ -13,6 +19,10 @@ end
 
 group :db do
   gemspec name: 'metasploit-framework-db'
+    # Metasploit::Credential database models
+  gem 'metasploit-credential', github: 'crmaxx/metasploit-credential', branch: 'staging/rails-4.2'
+  # Database models shared between framework and Pro.
+  gem 'metasploit_data_models', github: 'crmaxx/metasploit_data_models', branch: 'staging/rails-4.2'
 end
 
 group :development do
@@ -46,7 +56,7 @@ group :test do
   # cucumber extension for testing command line applications, like msfconsole
   gem 'aruba'
   # cucumber + automatic database cleaning with database_cleaner
-  gem 'cucumber-rails', :require => false
+  gem 'cucumber-rails', require: false
   gem 'shoulda-matchers'
   # Manipulate Time.now in specs
   gem 'timecop'
