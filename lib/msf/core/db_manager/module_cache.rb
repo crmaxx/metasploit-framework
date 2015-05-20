@@ -48,19 +48,19 @@ module Msf::DBManager::ModuleCache
     res[:description] = m.description.to_s.strip
 
     m.arch.map{ |x|
-      bits << [ :arch, { :name => x.to_s } ]
+      bits << [ :arch, { name: x.to_s } ]
     }
 
     m.platform.platforms.map{ |x|
-      bits << [ :platform, { :name => x.to_s.split('::').last.downcase } ]
+      bits << [ :platform, { name: x.to_s.split('::').last.downcase } ]
     }
 
     m.author.map{|x|
-      bits << [ :author, { :name => x.to_s } ]
+      bits << [ :author, { name: x.to_s } ]
     }
 
     m.references.map do |r|
-      bits << [ :ref, { :name => [r.ctx_id.to_s, r.ctx_val.to_s].join("-") } ]
+      bits << [ :ref, { name: [r.ctx_id.to_s, r.ctx_val.to_s].join("-") } ]
     end
 
     res[:privileged] = m.privileged?
@@ -77,14 +77,14 @@ module Msf::DBManager::ModuleCache
     if(m.type == "exploit")
 
       m.targets.each_index do |i|
-        bits << [ :target, { :index => i, :name => m.targets[i].name.to_s } ]
+        bits << [ :target, { index: i, name: m.targets[i].name.to_s } ]
         if m.targets[i].platform
           m.targets[i].platform.platforms.each do |name|
-            bits << [ :platform, { :name => name.to_s.split('::').last.downcase } ]
+            bits << [ :platform, { name: name.to_s.split('::').last.downcase } ]
           end
         end
         if m.targets[i].arch
-          bits << [ :arch, { :name => m.targets[i].arch.to_s } ]
+          bits << [ :arch, { name: m.targets[i].arch.to_s } ]
         end
       end
 
@@ -97,14 +97,14 @@ module Msf::DBManager::ModuleCache
 
 
       m.class.mixins.each do |x|
-         bits << [ :mixin, { :name => x.to_s } ]
+         bits << [ :mixin, { name: x.to_s } ]
       end
     end
 
     if(m.type == "auxiliary")
 
       m.actions.each_index do |i|
-        bits << [ :action, { :name => m.actions[i].name.to_s } ]
+        bits << [ :action, { name: m.actions[i].name.to_s } ]
       end
 
       if (m.default_action)
@@ -126,7 +126,7 @@ module Msf::DBManager::ModuleCache
   #
   # @return [void]
   def purge_all_module_details
-    return if not self.migrated
+    return unless self.migrated
     return if self.modules_caching
 
     ::ActiveRecord::Base.connection_pool.with_connection do
@@ -141,10 +141,10 @@ module Msf::DBManager::ModuleCache
   # @param refname [String] module reference name.
   # @return [void]
   def remove_module_details(mtype, refname)
-    return if not self.migrated
+    return unless self.migrated
 
     ActiveRecord::Base.connection_pool.with_connection do
-      Mdm::Module::Detail.where(:mtype => mtype, :refname => refname).destroy_all
+      Mdm::Module::Detail.where(mtype: mtype, refname: refname).destroy_all
     end
   end
 
@@ -208,84 +208,91 @@ module Msf::DBManager::ModuleCache
       # intersection, so creating the where clause has to be delayed until all conditions can be or'd together and
       # passed to one call ot where.
       union_conditions = []
+      join_sources = []
+
+      left_join = Arel::Nodes::OuterJoin
+      module_actions = Mdm::Module::Action.arel_table
+      module_authors = Mdm::Module::Author.arel_table
+      module_archs = Mdm::Module::Arch.arel_table
+      module_details = Mdm::Module::Detail.arel_table
+      module_platforms = Mdm::Module::Platform.arel_table
+      module_refs = Mdm::Module::Ref.arel_table
+      module_targets = Mdm::Module::Target.arel_table
 
       value_set_by_keyword.each do |keyword, value_set|
         case keyword
-          when 'author'
-            formatted_values = match_values(value_set)
+        when 'author'
+          formatted_values = match_values(value_set)
 
-            query = query.includes(:authors)
-            module_authors = Mdm::Module::Author.arel_table
-            union_conditions << module_authors[:email].matches_any(formatted_values)
-            union_conditions << module_authors[:name].matches_any(formatted_values)
-          when 'name'
-            formatted_values = match_values(value_set)
+          join_sources << module_details.join(module_authors, left_join).on(module_authors[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_authors[:email].matches_any(formatted_values)
+          union_conditions << module_authors[:name].matches_any(formatted_values)
+        when 'name'
+          formatted_values = match_values(value_set)
 
-            module_details = Mdm::Module::Detail.arel_table
-            union_conditions << module_details[:fullname].matches_any(formatted_values)
-            union_conditions << module_details[:name].matches_any(formatted_values)
-          when 'os', 'platform'
-            formatted_values = match_values(value_set)
+          union_conditions << module_details[:fullname].matches_any(formatted_values)
+          union_conditions << module_details[:name].matches_any(formatted_values)
+        when 'os', 'platform'
+          formatted_values = match_values(value_set)
 
-            query = query.includes(:platforms)
-            union_conditions << Mdm::Module::Platform.arel_table[:name].matches_any(formatted_values)
+          join_sources << module_details.join(module_platforms, left_join).on(module_platforms[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_platforms[:name].matches_any(formatted_values)
 
-            query = query.includes(:targets)
-            union_conditions << Mdm::Module::Target.arel_table[:name].matches_any(formatted_values)
-          when 'text'
-            formatted_values = match_values(value_set)
+          join_sources << module_details.join(module_targets, left_join).on(module_targets[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_targets[:name].matches_any(formatted_values)
+        when 'text'
+          formatted_values = match_values(value_set)
 
-            module_details = Mdm::Module::Detail.arel_table
-            union_conditions << module_details[:description].matches_any(formatted_values)
-            union_conditions << module_details[:fullname].matches_any(formatted_values)
-            union_conditions << module_details[:name].matches_any(formatted_values)
+          union_conditions << module_details[:description].matches_any(formatted_values)
+          union_conditions << module_details[:fullname].matches_any(formatted_values)
+          union_conditions << module_details[:name].matches_any(formatted_values)
 
-            query = query.includes(:actions)
-            union_conditions << Mdm::Module::Action.arel_table[:name].matches_any(formatted_values)
+          join_sources << module_details.join(module_actions, left_join).on(module_actions[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_actions[:name].matches_any(formatted_values)
 
-            query = query.includes(:archs)
-            union_conditions << Mdm::Module::Arch.arel_table[:name].matches_any(formatted_values)
+          join_sources << module_details.join(module_archs, left_join).on(module_archs[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_archs[:name].matches_any(formatted_values)
 
-            query = query.includes(:authors)
-            union_conditions << Mdm::Module::Author.arel_table[:name].matches_any(formatted_values)
+          join_sources << module_details.join(module_authors, left_join).on(module_authors[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_authors[:name].matches_any(formatted_values)
 
-            query = query.includes(:platforms)
-            union_conditions << Mdm::Module::Platform.arel_table[:name].matches_any(formatted_values)
+          join_sources << module_details.join(module_platforms, left_join).on(module_platforms[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_platforms[:name].matches_any(formatted_values)
 
-            query = query.includes(:refs)
-            union_conditions << Mdm::Module::Ref.arel_table[:name].matches_any(formatted_values)
+          join_sources << module_details.join(module_refs, left_join).on(module_refs[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_refs[:name].matches_any(formatted_values)
 
-            query = query.includes(:targets)
-            union_conditions << Mdm::Module::Target.arel_table[:name].matches_any(formatted_values)
-          when 'type'
-            formatted_values = match_values(value_set)
-            union_conditions << Mdm::Module::Detail.arel_table[:mtype].matches_any(formatted_values)
-          when 'app'
-            formatted_values = value_set.collect { |value|
-              formatted_value = 'aggressive'
+          join_sources << module_details.join(module_targets, left_join).on(module_targets[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_targets[:name].matches_any(formatted_values)
+        when 'type'
+          formatted_values = match_values(value_set)
+          union_conditions << module_details[:mtype].matches_any(formatted_values)
+        when 'app'
+          formatted_values = value_set.collect { |value|
+            formatted_value = 'aggressive'
 
-              if value == 'client'
-                formatted_value = 'passive'
-              end
+            if value == 'client'
+              formatted_value = 'passive'
+            end
 
-              formatted_value
-            }
+            formatted_value
+          }
 
-            union_conditions << Mdm::Module::Detail.arel_table[:stance].eq_any(formatted_values)
-          when 'ref'
-            formatted_values = match_values(value_set)
+          union_conditions << module_details[:stance].eq_any(formatted_values)
+        when 'ref'
+          formatted_values = match_values(value_set)
 
-            query = query.includes(:refs)
-            union_conditions << Mdm::Module::Ref.arel_table[:name].matches_any(formatted_values)
-          when 'cve', 'bid', 'osvdb', 'edb'
-            formatted_values = value_set.collect { |value|
-              prefix = keyword.upcase
+          join_sources << module_details.join(module_refs, left_join).on(module_refs[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_refs[:name].matches_any(formatted_values)
+        when 'cve', 'bid', 'osvdb', 'edb'
+          formatted_values = value_set.collect { |value|
+            prefix = keyword.upcase
 
-              "#{prefix}-%#{value}%"
-            }
+            "#{prefix}-%#{value}%"
+          }
 
-            query = query.includes(:refs)
-            union_conditions << Mdm::Module::Ref.arel_table[:name].matches_any(formatted_values)
+          join_sources << module_details.join(module_refs, left_join).on(module_refs[:detail_id].eq(module_details[:id])).join_sources
+          union_conditions << module_refs[:name].matches_any(formatted_values)
         end
       end
 
@@ -293,7 +300,7 @@ module Msf::DBManager::ModuleCache
         union.or(condition)
       }
 
-      query = query.where(unioned_conditions).to_a.uniq { |m| m.fullname }
+      query = query.joins(join_sources).where(unioned_conditions).to_a.uniq { |m| m.fullname }
     end
 
     query
@@ -307,7 +314,7 @@ module Msf::DBManager::ModuleCache
   #
   # @return [void]
   def update_all_module_details
-    return if not self.migrated
+    return unless self.migrated
     return if self.modules_caching
 
     self.framework.cache_thread = Thread.current
@@ -358,7 +365,7 @@ module Msf::DBManager::ModuleCache
         mt[1].keys.sort.each do |mn|
           next if skip_reference_name_set.include? mn
           obj = mt[1].create(mn)
-          next if not obj
+          next unless obj
           begin
             update_module_details(obj)
           rescue ::Exception
@@ -383,7 +390,7 @@ module Msf::DBManager::ModuleCache
   #   Mdm::Module::Detail.
   # @return [void]
   def update_module_details(module_instance)
-    return if not self.migrated
+    return unless self.migrated
 
     ActiveRecord::Base.connection_pool.with_connection do
       info = module_to_details_hash(module_instance)
@@ -394,18 +401,18 @@ module Msf::DBManager::ModuleCache
         otype, vals = args
 
         case otype
-          when :action
-            module_detail.add_action(vals[:name])
-          when :arch
-            module_detail.add_arch(vals[:name])
-          when :author
-            module_detail.add_author(vals[:name], vals[:email])
-          when :platform
-            module_detail.add_platform(vals[:name])
-          when :ref
-            module_detail.add_ref(vals[:name])
-          when :target
-            module_detail.add_target(vals[:index], vals[:name])
+        when :action
+          module_detail.add_action(vals[:name])
+        when :arch
+          module_detail.add_arch(vals[:name])
+        when :author
+          module_detail.add_author(vals[:name], vals[:email])
+        when :platform
+          module_detail.add_platform(vals[:name])
+        when :ref
+          module_detail.add_ref(vals[:name])
+        when :target
+          module_detail.add_target(vals[:index], vals[:name])
         end
       end
 
