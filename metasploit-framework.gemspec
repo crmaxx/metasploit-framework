@@ -69,8 +69,6 @@ Gem::Specification.new do |spec|
   # Things that would normally be part of the database model, but which
   # are needed when there's no database
   spec.add_runtime_dependency 'metasploit-model', '1.1.0'
-  # Needed for Meterpreter
-  spec.add_runtime_dependency 'metasploit-payloads', '1.1.10'
   # Needed by msfgui and other rpc components
   spec.add_runtime_dependency 'msgpack'
   # get list of network interfaces, like eth* from OS.
