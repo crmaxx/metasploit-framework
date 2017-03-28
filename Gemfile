@@ -4,7 +4,7 @@ source 'https://rubygems.org'
 gemspec name: 'metasploit-framework'
 
 # Needed for Meterpreter
-gem 'metasploit-payloads', github: 'OJ/metasploit-payloads', branch: 'named-pipe-channels'
+gem 'metasploit-payloads', github: 'sempervictus/metasploit-payloads', branch: 'feature-update_named_pipes_pr'
 
 # separate from test as simplecov is not run on travis-ci
 group :coverage do

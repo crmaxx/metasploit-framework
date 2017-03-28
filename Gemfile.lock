@@ -1,9 +1,9 @@
 GIT
-  remote: git://github.com/OJ/metasploit-payloads.git
-  revision: 52fd894f369fbc4a1d91176337df9af427e97358
-  branch: named-pipe-channels
+  remote: git://github.com/sempervictus/metasploit-payloads.git
+  revision: 084cde42e5fd21ff0cf7a9a28930b7f7c7de87b3
+  branch: feature-update_named_pipes_pr
   specs:
-    metasploit-payloads (1.1.12)
+    metasploit-payloads (1.2.5)
 
 PATH
   remote: .
