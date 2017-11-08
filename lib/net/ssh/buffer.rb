@@ -1,6 +1,8 @@
-# -*- coding: binary -*-
 require 'net/ssh/ruby_compat'
 require 'net/ssh/transport/openssl'
+
+require 'net/ssh/authentication/certificate'
+require 'net/ssh/authentication/ed25519_loader'
 
 module Net; module SSH
 
@@ -35,6 +37,7 @@ module Net; module SSH
     # * :long => write a 4-byte integer (#write_long)
     # * :byte => write a single byte (#write_byte)
     # * :string => write a 4-byte length followed by character data (#write_string)
+    # * :mstring => same as string, but caller cannot resuse the string, avoids potential duplication (#write_moved)
     # * :bool => write a single byte, interpreted as a boolean (#write_bool)
     # * :bignum => write an SSH-encoded bignum (#write_bignum)
     # * :key => write an SSH-encoded key value (#write_key)
@@ -160,7 +163,7 @@ module Net; module SSH
       index = @content.index(pattern, @position) or return nil
       length = case pattern
         when String then pattern.length
-        when Fixnum then 1
+        when Integer then 1
         when Regexp then $&.length
       end
       index && read(index+length)
@@ -183,7 +186,12 @@ module Net; module SSH
       consume!
       data
     end
-      
+
+    # Calls block(self) until the buffer is empty, and returns all results.
+    def read_all(&block)
+      Enumerator.new { |e| e << yield(self) until eof? }.to_a
+    end
+
     # Return the next 8 bytes as a 64-bit integer (in network byte order).
     # Returns nil if there are less than 8 bytes remaining to be read in the
     # buffer.
@@ -241,21 +249,48 @@ module Net; module SSH
     end
 
     # Read a keyblob of the given type from the buffer, and return it as
-    # a key. Only RSA and DSA keys are supported.
+    # a key. Only RSA, DSA, and ECDSA keys are supported.
     def read_keyblob(type)
       case type
-        when "ssh-dss"
+        when /^(.*)-cert-v01@openssh\.com$/
+          key = Net::SSH::Authentication::Certificate.read_certblob(self, $1)
+        when /^ssh-dss$/
           key = OpenSSL::PKey::DSA.new
-          key.p = read_bignum
-          key.q = read_bignum
-          key.g = read_bignum
-          key.pub_key = read_bignum
-
-        when "ssh-rsa"
+          if key.respond_to?(:set_pqg)
+            key.set_pqg(read_bignum, read_bignum, read_bignum)
+          else
+            key.p = read_bignum
+            key.q = read_bignum
+            key.g = read_bignum
+          end
+          if key.respond_to?(:set_key)
+            key.set_key(read_bignum, nil)
+          else
+            key.pub_key = read_bignum
+          end
+        when /^ssh-rsa$/
           key = OpenSSL::PKey::RSA.new
-          key.e = read_bignum
-          key.n = read_bignum
-
+          if key.respond_to?(:set_key)
+            e = read_bignum
+            n = read_bignum
+            key.set_key(n, e, nil)
+          else
+            key.e = read_bignum
+            key.n = read_bignum
+          end
+        when /^ssh-ed25519$/
+          Net::SSH::Authentication::ED25519Loader.raiseUnlessLoaded("unsupported key type `#{type}'")
+          key = Net::SSH::Authentication::ED25519::PubKey.read_keyblob(self)
+        when /^ecdsa\-sha2\-(\w*)$/
+          unless defined?(OpenSSL::PKey::EC)
+            raise NotImplementedError, "unsupported key type `#{type}'"
+          else
+            begin
+              key = OpenSSL::PKey::EC.read_keyblob($1, self)
+            rescue OpenSSL::PKey::ECError
+              raise NotImplementedError, "unsupported key type `#{type}'"
+            end
+          end
         else
           raise NotImplementedError, "unsupported key type `#{type}'"
       end
@@ -272,7 +307,14 @@ module Net; module SSH
     # Writes the given data literally into the string. Does not alter the
     # read position. Returns the buffer object.
     def write(*data)
-      data.each { |datum| @content << datum }
+      data.each { |datum| @content << datum.dup.force_encoding('BINARY') }
+      self
+    end
+
+    # Optimized version of write where the caller gives up ownership of string
+    # to the method. This way we can mutate the string.
+    def write_moved(string)
+      @content << string.force_encoding('BINARY')
       self
     end
 
@@ -309,8 +351,21 @@ module Net; module SSH
     def write_string(*text)
       text.each do |string|
         s = string.to_s
-        write_long(s.length)
+        write_long(s.bytesize)
         write(s)
+      end
+      self
+    end
+
+    # Writes each argument to the buffer as an SSH2-encoded string. Each
+    # string is prefixed by its length, encoded as a 4-byte long integer.
+    # Does not alter the read position. Returns the buffer object.
+    # Might alter arguments see write_moved
+    def write_mstring(*text)
+      text.each do |string|
+        s = string.to_s
+        write_long(s.bytesize)
+        write_moved(s)
       end
       self
     end

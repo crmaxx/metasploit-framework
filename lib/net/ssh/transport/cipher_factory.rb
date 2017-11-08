@@ -1,5 +1,6 @@
-# -*- coding: binary -*-
 require 'openssl'
+require 'net/ssh/transport/ctr.rb'
+require 'net/ssh/transport/key_expander'
 require 'net/ssh/transport/identity_cipher'
 
 module Net; module SSH; module Transport
@@ -18,8 +19,27 @@ module Net; module SSH; module Transport
       "rijndael-cbc@lysator.liu.se" => "aes-256-cbc",
       "arcfour128"                  => "rc4",
       "arcfour256"                  => "rc4",
-      "none"                        => "none"
+      "arcfour512"                  => "rc4",
+      "arcfour"                     => "rc4",
+
+      "3des-ctr"                    => "des-ede3",
+      "blowfish-ctr"                => "bf-ecb",
+      "aes256-ctr"                  => "aes-256-ecb",
+      "aes192-ctr"                  => "aes-192-ecb",
+      "aes128-ctr"                  => "aes-128-ecb",
+      "cast128-ctr"                 => "cast5-ecb",
+
+      "none"                        => "none",
     }
+
+    # Ruby's OpenSSL bindings always return a key length of 16 for RC4 ciphers
+    # resulting in the error: OpenSSL::CipherError: key length too short.
+    # The following ciphers will override this key length.
+    KEY_LEN_OVERRIDE = {
+      "arcfour256"                  => 32,
+      "arcfour512"                  => 64
+    }
+
 
     # Returns true if the underlying OpenSSL library supports the given cipher,
     # and false otherwise.
@@ -37,15 +57,19 @@ module Net; module SSH; module Transport
     def self.get(name, options={})
       ossl_name = SSH_TO_OSSL[name] or raise NotImplementedError, "unimplemented cipher `#{name}'"
       return IdentityCipher if ossl_name == "none"
+      cipher = OpenSSL::Cipher.new(ossl_name)
 
-      cipher = OpenSSL::Cipher::Cipher.new(ossl_name)
       cipher.send(options[:encrypt] ? :encrypt : :decrypt)
 
       cipher.padding = 0
-      cipher.iv      = make_key(cipher.iv_len, options[:iv], options) if ossl_name != "rc4"
-      cipher.key_len = 32 if name == "arcfour256"
-      cipher.key     = make_key(cipher.key_len, options[:key], options)
-      cipher.update(" " * 1536) if ossl_name == "rc4"
+
+      cipher.extend(Net::SSH::Transport::CTR) if (name =~ /-ctr(@openssh.org)?$/)
+      cipher.iv = Net::SSH::Transport::KeyExpander.expand_key(cipher.iv_len, options[:iv], options) if ossl_name != "rc4"
+
+      key_len = KEY_LEN_OVERRIDE[name] || cipher.key_len
+      cipher.key_len = key_len
+      cipher.key = Net::SSH::Transport::KeyExpander.expand_key(key_len, options[:key], options)
+      cipher.update(" " * 1536) if (ossl_name == "rc4" && name != "arcfour")
 
       return cipher
     end
@@ -54,32 +78,22 @@ module Net; module SSH; module Transport
     # block-size ] for the named cipher algorithm. If the cipher
     # algorithm is unknown, or is "none", 0 is returned for both elements
     # of the tuple.
-    def self.get_lengths(name)
+    # if :iv_len option is supplied the third return value will be ivlen
+    def self.get_lengths(name, options = {})
       ossl_name = SSH_TO_OSSL[name]
-      return [0, 0] if ossl_name.nil? || ossl_name == "none"
+      if ossl_name.nil? || ossl_name == "none"
+        result = [0, 0]
+        result << 0 if options[:iv_len]
+      else
+        cipher = OpenSSL::Cipher.new(ossl_name)
+        key_len = KEY_LEN_OVERRIDE[name] || cipher.key_len
+        cipher.key_len = key_len
 
-      cipher = OpenSSL::Cipher::Cipher.new(ossl_name)
-      return [cipher.key_len, ossl_name=="rc4" ? 8 : cipher.block_size]
-    end
-
-    private
-
-      # Generate a key value in accordance with the SSH2 specification.
-      def self.make_key(bytes, start, options={})
-        k = start[0, bytes]
-
-        digester = options[:digester]
-        shared   = options[:shared]
-        hash     = options[:hash]
-
-        while k.length < bytes
-          step = digester.digest(shared + hash + k)
-          bytes_needed = bytes - k.length
-          k << step[0, bytes_needed]
-        end
-
-        return k
+        result = [key_len, ossl_name=="rc4" ? 8 : cipher.block_size]
+        result << cipher.iv_len if options[:iv_len]
       end
+      result
+    end
   end
 
 end; end; end

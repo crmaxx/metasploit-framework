@@ -1,4 +1,3 @@
-# -*- coding: binary -*-
 require 'net/ssh/errors'
 require 'net/ssh/key_factory'
 require 'net/ssh/loggable'
@@ -13,7 +12,7 @@ module Net
 
       # This class encapsulates all operations done by clients on a user's
       # private keys. In practice, the client should never need a reference
-      # to a private key; instead, they grab a list of "identities" (public 
+      # to a private key; instead, they grab a list of "identities" (public
       # keys) that are available from the KeyManager, and then use
       # the KeyManager to do various private key operations using those
       # identities.
@@ -38,12 +37,13 @@ module Net
         attr_reader :options
 
         # Create a new KeyManager. By default, the manager will
-        # use the ssh-agent (if it is running).
+        # use the ssh-agent if it is running and the `:use_agent` option
+        # is not false.
         def initialize(logger, options={})
           self.logger = logger
           @key_files = []
           @key_data = []
-          @use_agent = true
+          @use_agent = !(options[:use_agent] == false)
           @known_identities = {}
           @agent = nil
           @options = options
@@ -91,47 +91,35 @@ module Net
         # The origin of the identities may be from files on disk or from an
         # ssh-agent. Note that identities from an ssh-agent are always listed
         # first in the array, with other identities coming after.
+        #
+        # If key manager was created with :keys_only option, any identity
+        # from ssh-agent will be ignored unless it present in key_files or
+        # key_data.
         def each_identity
+          prepared_identities = prepare_identities_from_files + prepare_identities_from_data
+
+          user_identities = load_identities(prepared_identities, false, true)
+
           if agent
             agent.identities.each do |key|
-              known_identities[key] = { :from => :agent }
-              yield key
-            end
-          end
-          
-          key_files.each do |file|
-            public_key_file = file + ".pub"
-            if File.readable?(public_key_file)
-              begin
-                key = KeyFactory.load_public_key(public_key_file)
-                known_identities[key] = { :from => :file, :file => file }
+              corresponding_user_identity = user_identities.detect { |identity|
+                identity[:public_key] && identity[:public_key].to_pem == key.to_pem
+              }
+              user_identities.delete(corresponding_user_identity) if corresponding_user_identity
+
+              if !options[:keys_only] || corresponding_user_identity
+                known_identities[key] = { from: :agent }
                 yield key
-              rescue Exception => e
-                error { "could not load public key file `#{public_key_file}': #{e.class} (#{e.message})" }
-              end
-            elsif File.readable?(file)
-              begin
-                private_key = KeyFactory.load_private_key(file, options[:passphrase])
-                key = private_key.send(:public_key)
-                known_identities[key] = { :from => :file, :file => file, :key => private_key }
-                yield key
-              rescue Exception => e
-                error { "could not load private key file `#{file}': #{e.class} (#{e.message})" }
               end
             end
           end
 
-          key_data.each do |data|
-            if @options[:skip_private_keys]
-              key = KeyFactory.load_data_public_key(data)
-              known_identities[key] = { :from => :key_data, :data => data }
+          user_identities = load_identities(user_identities, !options[:non_interactive], false)
+
+          user_identities.each do |identity|
+            key = identity.delete(:public_key)
+            known_identities[key] = identity
             yield key
-            else
-              private_key = KeyFactory.load_data_private_key(data)
-              key = private_key.send(:public_key)
-              known_identities[key] = { :from => :key_data, :data => data, :key => private_key }
-              yield key
-            end
           end
 
           self
@@ -151,15 +139,15 @@ module Net
 
           if info[:key].nil? && info[:from] == :file
             begin
-              info[:key] = KeyFactory.load_private_key(info[:file], options[:passphrase])
-            rescue Exception => e 
+              info[:key] = KeyFactory.load_private_key(info[:file], options[:passphrase], !options[:non_interactive])
+            rescue OpenSSL::OpenSSLError, Exception => e
               raise KeyManagerError, "the given identity is known, but the private key could not be loaded: #{e.class} (#{e.message})"
             end
           end
 
           if info[:key]
-            return Net::SSH::Buffer.from(:string, identity.ssh_type,
-              :string, info[:key].ssh_do_sign(data.to_s)).to_s
+            return Net::SSH::Buffer.from(:string, identity.ssh_signature_type,
+              :mstring, info[:key].ssh_do_sign(data.to_s)).to_s
           end
 
           if info[:from] == :agent
@@ -172,7 +160,6 @@ module Net
 
         # Identifies whether the ssh-agent will be used or not.
         def use_agent?
-          return false if @options[:disable_agent]
           @use_agent
         end
 
@@ -189,13 +176,92 @@ module Net
         # or if the agent is otherwise not available.
         def agent
           return unless use_agent?
-          @agent ||= Agent.connect(logger)
+          @agent ||= Agent.connect(logger, options[:agent_socket_factory])
         rescue AgentNotAvailable
           @use_agent = false
           nil
         end
-      end
 
+        private
+
+        # Prepares identities from user key_files for loading, preserving their order and sources.
+        def prepare_identities_from_files
+          key_files.map do |file|
+            if readable_file?(file)
+              identity = {}
+              cert_file = file + "-cert.pub"
+              public_key_file = file + ".pub"
+              if readable_file?(cert_file)
+                identity[:load_from] = :pubkey_file
+                identity[:pubkey_file] = cert_file
+              elsif readable_file?(public_key_file)
+                identity[:load_from] = :pubkey_file
+                identity[:pubkey_file] = public_key_file
+              else
+                identity[:load_from] = :privkey_file
+              end
+              identity.merge(privkey_file: file)
+            end
+          end.compact
+        end
+
+        def readable_file?(path)
+          File.file?(path) && File.readable?(path)
+        end
+
+        # Prepared identities from user key_data, preserving their order and sources.
+        def prepare_identities_from_data
+          key_data.map do |data|
+            { load_from: :data, data: data }
+          end
+        end
+
+        # Load prepared identities. Private key decryption errors ignored if ignore_decryption_errors
+        def load_identities(identities, ask_passphrase, ignore_decryption_errors)
+          identities.map do |identity|
+            begin
+              case identity[:load_from]
+              when :pubkey_file
+                key = KeyFactory.load_public_key(identity[:pubkey_file])
+                { public_key: key, from: :file, file: identity[:privkey_file] }
+              when :privkey_file
+                private_key = KeyFactory.load_private_key(identity[:privkey_file], options[:passphrase], ask_passphrase, options[:password_prompt])
+                key = private_key.send(:public_key)
+                { public_key: key, from: :file, file: identity[:privkey_file], key: private_key }
+              when :data
+                private_key = KeyFactory.load_data_private_key(identity[:data], options[:passphrase], ask_passphrase, "<key in memory>", options[:password_prompt])
+                key = private_key.send(:public_key)
+                { public_key: key, from: :key_data, data: identity[:data], key: private_key }
+              else
+                identity
+              end
+
+            rescue OpenSSL::PKey::RSAError, OpenSSL::PKey::DSAError, OpenSSL::PKey::ECError, OpenSSL::PKey::PKeyError, ArgumentError => e
+              if ignore_decryption_errors
+                identity
+              else
+                process_identity_loading_error(identity, e)
+                nil
+              end
+            rescue Exception => e
+              process_identity_loading_error(identity, e)
+              nil
+            end
+          end.compact
+        end
+
+        def process_identity_loading_error(identity, e)
+          case identity[:load_from]
+          when :pubkey_file
+            error { "could not load public key file `#{identity[:pubkey_file]}': #{e.class} (#{e.message})" }
+          when :privkey_file
+            error { "could not load private key file `#{identity[:privkey_file]}': #{e.class} (#{e.message})" }
+          else
+            raise e
+          end
+        end
+
+      end
     end
   end
 end

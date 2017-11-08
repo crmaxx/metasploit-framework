@@ -1,8 +1,36 @@
-# -*- coding: binary -*-
 require 'strscan'
+require 'openssl'
+require 'base64'
 require 'net/ssh/buffer'
 
 module Net; module SSH
+
+  # Represents the result of a search in known hosts
+  # see search_for
+  class HostKeys
+    include Enumerable
+    attr_reader :host
+
+    def initialize(host_keys, host, known_hosts, options = {})
+       @host_keys = host_keys
+       @host = host
+       @known_hosts = known_hosts
+       @options = options
+    end
+
+    def add_host_key(key)
+       @known_hosts.add(@host, key, @options)
+       @host_keys.push(key)
+    end
+
+    def each(&block)
+       @host_keys.each(&block)
+    end
+
+    def empty?
+      @host_keys.empty?
+    end
+  end
 
   # Searches an OpenSSH-style known-host file for a given host, and returns all
   # matching keys. This is used to implement host-key verification, as well as
@@ -11,11 +39,23 @@ module Net; module SSH
   # This is used internally by Net::SSH, and will never need to be used directly
   # by consumers of the library.
   class KnownHosts
+
+    if defined?(OpenSSL::PKey::EC)
+      SUPPORTED_TYPE = %w(ssh-rsa ssh-dss
+                          ecdsa-sha2-nistp256
+                          ecdsa-sha2-nistp384
+                          ecdsa-sha2-nistp521)
+    else
+      SUPPORTED_TYPE = %w(ssh-rsa ssh-dss)
+    end
+
+
     class <<self
+
       # Searches all known host files (see KnownHosts.hostfiles) for all keys
-      # of the given host. Returns an array of keys found.
+      # of the given host. Returns an enumerable of keys found.
       def search_for(host, options={})
-        search_in(hostfiles(options), host)
+        HostKeys.new(search_in(hostfiles(options), host), host, self, options)
       end
 
       # Search for all known keys for the given host, in every file given in
@@ -29,7 +69,7 @@ module Net; module SSH
       # hosts files. If the :user_known_hosts_file key is not set, the
       # default is returned (~/.ssh/known_hosts and ~/.ssh/known_hosts2). If
       # :global_known_hosts_file is not set, the default is used
-      # (/etc/ssh/known_hosts and /etc/ssh/known_hosts2).
+      # (/etc/ssh/ssh_known_hosts and /etc/ssh/ssh_known_hosts2).
       #
       # If you only want the user known host files, you can pass :user as
       # the second option.
@@ -41,7 +81,7 @@ module Net; module SSH
         end
 
         if which == :all || which == :global
-          files += Array(options[:global_known_hosts_file] || %w(/etc/ssh/known_hosts /etc/ssh/known_hosts2))
+          files += Array(options[:global_known_hosts_file] || %w(/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2))
         end
 
         return files
@@ -100,12 +140,14 @@ module Net; module SSH
           next if scanner.match?(/$|#/)
 
           hostlist = scanner.scan(/\S+/).split(/,/)
-          next unless entries.all? { |entry| hostlist.include?(entry) }
+          found = entries.all? { |entry| hostlist.include?(entry) } ||
+            known_host_hash?(hostlist, entries, scanner)
+          next unless found
 
           scanner.skip(/\s*/)
           type = scanner.scan(/\S+/)
 
-          next unless %w(ssh-rsa ssh-dss).include?(type)
+          next unless SUPPORTED_TYPE.include?(type)
 
           scanner.skip(/\s*/)
           blob = scanner.rest.unpack("m*").first
@@ -116,13 +158,25 @@ module Net; module SSH
       keys
     end
 
+    # Indicates whether one of the entries matches an hostname that has been
+    # stored as a HMAC-SHA1 hash in the known hosts.
+    def known_host_hash?(hostlist, entries, scanner)
+      if hostlist.size == 1 && hostlist.first =~ /\A\|1(\|.+){2}\z/
+        chunks = hostlist.first.split(/\|/)
+        salt = Base64.decode64(chunks[2])
+        digest = OpenSSL::Digest.new('sha1')
+        entries.each do |entry|
+          hmac = OpenSSL::HMAC.digest(digest, salt, entry)
+          return true if Base64.encode64(hmac).chomp == chunks[3]
+        end
+      end
+      false
+    end
+
     # Tries to append an entry to the current source file for the given host
     # and key. If it is unable to (because the file is not writable, for
     # instance), an exception will be raised.
     def add(host, key)
-    # Forget that. No way I want this thing writing to my known_hosts file.
-    # Some day, make this configurable. Until that day, off by default.
-    return
       File.open(source, "a") do |file|
         blob = [Net::SSH::Buffer.from(:key, key).to_s].pack("m*").gsub(/\s/, "")
         file.puts "#{host} #{key.ssh_type} #{blob}"

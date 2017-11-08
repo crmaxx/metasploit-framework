@@ -1,11 +1,9 @@
-# -*- coding: binary -*-
-require 'rex/socket'
-
 # Make sure HOME is set, regardless of OS, so that File.expand_path works
 # as expected with tilde characters.
-ENV['HOME'] ||= ENV['HOMEPATH'] ? "#{ENV['HOMEDRIVE']}#{ENV['HOMEPATH']}" : "."
+ENV['HOME'] ||= ENV['HOMEPATH'] ? "#{ENV['HOMEDRIVE']}#{ENV['HOMEPATH']}" : Dir.pwd
 
 require 'logger'
+require 'etc'
 
 require 'net/ssh/config'
 require 'net/ssh/errors'
@@ -13,8 +11,7 @@ require 'net/ssh/loggable'
 require 'net/ssh/transport/session'
 require 'net/ssh/authentication/session'
 require 'net/ssh/connection/session'
-require 'net/ssh/command_stream'
-require 'net/ssh/utils'
+require 'net/ssh/prompt'
 
 module Net
 
@@ -44,21 +41,21 @@ module Net
   #
   # == X == "execute a command and capture the output"
   #
-  #   Net::SSH.start("host", "user", :password => "password") do |ssh|
+  #   Net::SSH.start("host", "user", password: "password") do |ssh|
   #     result = ssh.exec!("ls -l")
   #     puts result
   #   end
   #
   # == X == "forward connections on a local port to a remote host"
   #
-  #   Net::SSH.start("host", "user", :password => "password") do |ssh|
+  #   Net::SSH.start("host", "user", password: "password") do |ssh|
   #     ssh.forward.local(1234, "www.google.com", 80)
   #     ssh.loop { true }
   #   end
   #
   # == X == "forward connections on a remote port to the local host"
   #
-  #   Net::SSH.start("host", "user", :password => "password") do |ssh|
+  #   Net::SSH.start("host", "user", password: "password") do |ssh|
   #     ssh.forward.remote(80, "www.google.com", 1234)
   #     ssh.loop { true }
   #   end
@@ -66,14 +63,16 @@ module Net
     # This is the set of options that Net::SSH.start recognizes. See
     # Net::SSH.start for a description of each option.
     VALID_OPTIONS = [
-      :auth_methods, :compression, :compression_level, :config, :encryption,
-      :forward_agent, :hmac, :host_key, :kex, :keys, :key_data, :languages,
-      :logger, :paranoid, :password, :port, :proxy, :rekey_blocks_limit,
-      :rekey_limit, :rekey_packet_limit, :timeout, :verbose,
-      :global_known_hosts_file, :user_known_hosts_file, :host_key_alias,
-      :host_name, :user, :properties, :passphrase, :msframework, :msfmodule,
-      :record_auth_info, :skip_private_keys, :accepted_key_callback, :disable_agent,
-      :proxies
+      :auth_methods, :bind_address, :compression, :compression_level, :config,
+      :encryption, :forward_agent, :hmac, :host_key, :remote_user,
+      :keepalive, :keepalive_interval, :keepalive_maxcount, :kex, :keys, :key_data,
+      :languages, :logger, :paranoid, :password, :port, :proxy,
+      :rekey_blocks_limit,:rekey_limit, :rekey_packet_limit, :timeout, :verbose,
+      :known_hosts, :global_known_hosts_file, :user_known_hosts_file, :host_key_alias,
+      :host_name, :user, :properties, :passphrase, :keys_only, :max_pkt_size,
+      :max_win_size, :send_env, :use_agent, :number_of_password_prompts,
+      :append_all_supported_algorithms, :non_interactive, :password_prompt,
+      :agent_socket_factory, :minimum_dh_bits, :verify_host_key
     ]
 
     # The standard means of starting a new SSH connection. When used with a
@@ -105,6 +104,9 @@ module Net
     # This method accepts the following options (all are optional):
     #
     # * :auth_methods => an array of authentication methods to try
+    # * :bind_address => the IP address on the connecting machine to use in
+    #   establishing connection. (:bind_address is discarded if :proxy
+    #   is set.)
     # * :compression => the compression algorithm to use, or +true+ to use
     #   whatever is supported.
     # * :compression_level => the compression level to use when sending data
@@ -115,9 +117,11 @@ module Net
     # * :encryption => the encryption cipher (or ciphers) to use
     # * :forward_agent => set to true if you want the SSH agent connection to
     #   be forwarded
+    # * :known_hosts => a custom object holding known hosts records.
+    #   It must implement #search_for and add in a similiar manner as KnownHosts.
     # * :global_known_hosts_file => the location of the global known hosts
     #   file. Set to an array if you want to specify multiple global known
-    #   hosts files. Defaults to %w(/etc/ssh/known_hosts /etc/ssh/known_hosts2).
+    #   hosts files. Defaults to %w(/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2).
     # * :hmac => the hmac algorithm (or algorithms) to use
     # * :host_key => the host key algorithm (or algorithms) to use
     # * :host_key_alias => the host name to use when looking up or adding a
@@ -127,14 +131,33 @@ module Net
     #   specified in an SSH configuration file. It lets you specify an
     #   "alias", similarly to adding an entry in /etc/hosts but without needing
     #   to modify /etc/hosts.
+    # * :keepalive => set to +true+ to send a keepalive packet to the SSH server
+    #   when there's no traffic between the SSH server and Net::SSH client for
+    #   the keepalive_interval seconds. Defaults to +false+.
+    # * :keepalive_interval => the interval seconds for keepalive.
+    #   Defaults to +300+ seconds.
+    # * :keepalive_maxcount => the maximun number of keepalive packet miss allowed.
+    #   Defaults to 3
     # * :kex => the key exchange algorithm (or algorithms) to use
     # * :keys => an array of file names of private keys to use for publickey
     #   and hostbased authentication
     # * :key_data => an array of strings, with each element of the array being
     #   a raw private key in PEM format.
+    # * :keys_only => set to +true+ to use only private keys from +keys+ and
+    #   +key_data+ parameters, even if ssh-agent offers more identities. This
+    #   option is intended for situations where ssh-agent offers many different
+    #   identites.
     # * :logger => the logger instance to use when logging
-    # * :paranoid => either true, false, or :very, specifying how strict
-    #   host-key verification should be
+    # * :max_pkt_size => maximum size we tell the other side that is supported per
+    #   packet. Default is 0x8000 (32768 bytes). Increase to 0x10000 (65536 bytes)
+    #   for better performance if your SSH server supports it (most do).
+    # * :max_win_size => maximum size we tell the other side that is supported for
+    #   the window.
+    # * :non_interactive => set to true if your app is non interactive and prefers
+    #   authentication failure vs password prompt. Non-interactive applications
+    #   should set it to true to prefer failing a password/etc auth methods vs.
+    #   asking for password.
+    # * :paranoid => deprecated alias for :verify_host_key
     # * :passphrase => the passphrase to use when loading a private key (default
     #   is +nil+, for no passphrase)
     # * :password => the password to use to login
@@ -145,35 +168,63 @@ module Net
     # * :rekey_blocks_limit => the max number of blocks to process before rekeying
     # * :rekey_limit => the max number of bytes to process before rekeying
     # * :rekey_packet_limit => the max number of packets to process before rekeying
+    # * :send_env => an array of local environment variable names to export to the
+    #   remote environment. Names may be given as String or Regexp.
     # * :timeout => how long to wait for the initial connection to be made
     # * :user => the user name to log in as; this overrides the +user+
     #   parameter, and is primarily only useful when provided via an SSH
     #   configuration file.
+    # * :remote_user => used for substitution into the '%r' part of a ProxyCommand
     # * :user_known_hosts_file => the location of the user known hosts file.
     #   Set to an array to specify multiple user known hosts files.
     #   Defaults to %w(~/.ssh/known_hosts ~/.ssh/known_hosts2).
+    # * :use_agent => Set false to disable the use of ssh-agent. Defaults to
+    #   true
     # * :verbose => how verbose to be (Logger verbosity constants, Logger::DEBUG
     #   is very verbose, Logger::FATAL is all but silent). Logger::FATAL is the
     #   default. The symbols :debug, :info, :warn, :error, and :fatal are also
     #   supported and are translated to the corresponding Logger constant.
-    def self.start(host, user, options={}, &block)
+    # * :append_all_supported_algorithms => set to +true+ to append all supported
+    #   algorithms by net-ssh. Was the default behaviour until 2.10
+    # * :number_of_password_prompts => Number of prompts for the password
+    #   authentication method defaults to 3 set to 0 to disable prompt for
+    #   password auth method
+    # * :password_prompt => a custom prompt object with ask method. See Net::SSH::Prompt
+    #
+    # * :agent_socket_factory => enables the user to pass a lambda/block that will serve as the socket factory
+    #    Net::SSH::start(user,host,agent_socket_factory: ->{ UNIXSocket.open('/foo/bar') })
+    #    example: ->{ UNIXSocket.open('/foo/bar')}
+    # * :verify_host_key => either false, true, :very, or :secure specifying how
+    #   strict host-key verification should be (in increasing order here).
+    #   You can also provide an own Object which responds to +verify+. The argument
+    #   given to +verify+ is a hash consisting of the +:key+, the +:key_blob+,
+    #   the +:fingerprint+ and the +:session+. Returning true accepts the host key,
+    #   returning false declines it and closes the connection.
+    #
+    # If +user+ parameter is nil it defaults to USER from ssh_config, or
+    # local username
+    def self.start(host, user=nil, options={}, &block)
       invalid_options = options.keys - VALID_OPTIONS
       if invalid_options.any?
         raise ArgumentError, "invalid option(s): #{invalid_options.join(', ')}"
       end
 
+      assign_defaults(options)
+      _sanitize_options(options)
+
       options[:user] = user if user
       options = configuration_for(host, options.fetch(:config, true)).merge(options)
       host = options.fetch(:host_name, host)
 
-      if !options.key?(:logger)
-        options[:logger] = Logger.new(STDERR)
-        options[:logger].level = Logger::FATAL
+      if options[:non_interactive]
+        options[:number_of_password_prompts] = 0
       end
+
+      _support_deprecated_option_paranoid(options)
 
       if options[:verbose]
         options[:logger].level = case options[:verbose]
-          when Fixnum then options[:verbose]
+          when Integer then options[:verbose]
           when :debug then Logger::DEBUG
           when :info  then Logger::INFO
           when :warn  then Logger::WARN
@@ -186,26 +237,21 @@ module Net
       transport = Transport::Session.new(host, options)
       auth = Authentication::Session.new(transport, options)
 
-      user = options.fetch(:user, user)
+      user = options.fetch(:user, user) || Etc.getlogin
       if auth.authenticate("ssh-connection", user, options[:password])
         connection = Connection::Session.new(transport, options)
-        connection.auth_info = auth.auth_info
-
-        # Tell MSF not to auto-close this socket anymore...
-        # This allows the transport socket to surive with the session.
-        if options[:msfmodule]
-          options[:msfmodule].remove_socket(transport.socket)
-        end
-
         if block_given?
-          yield connection
-          connection.close
+          begin
+            yield connection
+          ensure
+            connection.close unless connection.closed?
+          end
         else
           return connection
         end
       else
         transport.close
-        raise AuthenticationFailed, user
+        raise AuthenticationFailed, "Authentication failed for user #{user}@#{host}"
       end
     end
 
@@ -218,15 +264,54 @@ module Net
     # to read.
     #
     # See Net::SSH::Config for the full description of all supported options.
-    def self.configuration_for(host, use_ssh_config=true)
+    def self.configuration_for(host, use_ssh_config)
       files = case use_ssh_config
-        when true then Net::SSH::Config.default_files
+        when true then Net::SSH::Config.expandable_default_files
         when false, nil then return {}
         else Array(use_ssh_config)
         end
 
       Net::SSH::Config.for(host, files)
     end
+
+    def self.assign_defaults(options)
+      if !options[:logger]
+        options[:logger] = Logger.new(STDERR)
+        options[:logger].level = Logger::FATAL
+      end
+
+      options[:password_prompt] ||= Prompt.default(options)
+
+      [:password, :passphrase].each do |key|
+        options.delete(key) if options.key?(key) && options[key].nil?
+      end
+    end
+
+    def self._sanitize_options(options)
+      invalid_option_values = [nil,[nil]]
+      unless (options.values & invalid_option_values).empty?
+        nil_options = options.select { |_k,v| invalid_option_values.include?(v) }.map(&:first)
+        Kernel.warn "#{caller_locations(2, 1)[0]}: Passing nil, or [nil] to Net::SSH.start is deprecated for keys: #{nil_options.join(', ')}"
+      end
+    end
+    private_class_method :_sanitize_options
+
+    def self._support_deprecated_option_paranoid(options)
+      if options.key?(:paranoid)
+        Kernel.warn(
+          ":paranoid is deprecated, please use :verify_host_key. Supported " \
+          "values are exactly the same, only the name of the option has changed."
+        )
+        if options.key?(:verify_host_key)
+          Kernel.warn(
+            "Both :paranoid and :verify_host_key were specified. " \
+            ":verify_host_key takes precedence, :paranoid will be ignored."
+          )
+        else
+          options[:verify_host_key] = options.delete(:paranoid)
+        end
+      end
+    end
+    private_class_method :_support_deprecated_option_paranoid
   end
 end
-

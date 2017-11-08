@@ -1,14 +1,18 @@
-# -*- coding: binary -*-
 require 'net/ssh/loggable'
 require 'net/ssh/transport/constants'
 require 'net/ssh/authentication/constants'
 require 'net/ssh/authentication/key_manager'
+require 'net/ssh/authentication/methods/none'
 require 'net/ssh/authentication/methods/publickey'
 require 'net/ssh/authentication/methods/hostbased'
 require 'net/ssh/authentication/methods/password'
 require 'net/ssh/authentication/methods/keyboard_interactive'
 
 module Net; module SSH; module Authentication
+
+  # Raised if the current authentication method is not allowed
+  class DisallowedMethod < Net::SSH::Exception
+  end
 
   # Represents an authentication session. It manages the authentication of
   # a user over an established connection (the "transport" object, see
@@ -32,28 +36,16 @@ module Net; module SSH; module Authentication
     # a hash of options, given at construction time
     attr_reader :options
 
-    # when a successful auth is made, note the auth info if session.options[:record_auth_info]
-    attr_accessor :auth_info
-    
-    # when a public key is accepted (even if not used), trigger a callback
-    attr_accessor :accepted_key_callback
-    
-    # when we only want to test a key and not login
-    attr_accessor :skip_private_keys
-
     # Instantiates a new Authentication::Session object over the given
     # transport layer abstraction.
     def initialize(transport, options={})
       self.logger = transport.logger
       @transport = transport
 
-      @auth_methods = options[:auth_methods] || %w(publickey hostbased password keyboard-interactive)
+      @auth_methods = options[:auth_methods] || Net::SSH::Config.default_auth_methods
       @options = options
 
-      @allowed_auth_methods  = @auth_methods
-      @skip_private_keys     = options[:skip_private_keys] || false
-      @accepted_key_callback = options[:accepted_key_callback]     
-      @auth_info = {}      
+      @allowed_auth_methods = @auth_methods
     end
 
     # Attempts to authenticate the given user, in preparation for the next
@@ -63,7 +55,7 @@ module Net; module SSH; module Authentication
       debug { "beginning authentication of `#{username}'" }
 
       transport.send_message(transport.service_request("ssh-userauth"))
-      message = expect_message(SERVICE_ACCEPT)
+      expect_message(SERVICE_ACCEPT)
 
       key_manager = KeyManager.new(logger, options)
       keys.each { |key| key_manager.add(key) } unless keys.empty?
@@ -72,13 +64,22 @@ module Net; module SSH; module Authentication
       attempted = []
 
       @auth_methods.each do |name|
-        next unless @allowed_auth_methods.include?(name)
-        attempted << name
+        begin
+          next unless @allowed_auth_methods.include?(name)
+          attempted << name
 
-        debug { "trying #{name}" }
-        method = Methods.const_get(name.split(/\W+/).map { |p| p.capitalize }.join).new(self, :key_manager => key_manager)
+          debug { "trying #{name}" }
+          begin
+            auth_class = Methods.const_get(name.split(/\W+/).map { |p| p.capitalize }.join)
+            method = auth_class.new(self, key_manager: key_manager, password_prompt: options[:password_prompt])
+          rescue NameError
+            debug{"Mechanism #{name} was requested, but isn't a known type.  Ignoring it."}
+            next
+          end
 
-        return true if method.authenticate(next_service, username, password)
+          return true if method.authenticate(next_service, username, password)
+        rescue Net::SSH::Authentication::DisallowedMethod
+        end
       end
 
       error { "all authorization methods failed (tried #{attempted.join(', ')})" }
@@ -129,13 +130,21 @@ module Net; module SSH; module Authentication
 
     private
 
+      # Returns an array of paths to the key files usually defined
+      # by system default.
+      def default_keys
+        if defined?(OpenSSL::PKey::EC)
+          %w(~/.ssh/id_ed25519 ~/.ssh/id_rsa ~/.ssh/id_dsa ~/.ssh/id_ecdsa
+             ~/.ssh2/id_ed25519 ~/.ssh2/id_rsa ~/.ssh2/id_dsa ~/.ssh2/id_ecdsa)
+        else
+          %w(~/.ssh/id_dsa ~/.ssh/id_rsa ~/.ssh2/id_dsa ~/.ssh2/id_rsa)
+        end
+      end
+
       # Returns an array of paths to the key files that should be used when
       # attempting any key-based authentication mechanism.
       def keys
-      Array(
-        options[:keys] # ||
-        # %w(~/.ssh/id_dsa ~/.ssh/id_rsa ~/.ssh2/id_dsa ~/.ssh2/id_rsa)
-        )
+        Array(options[:keys] || default_keys)
       end
 
       # Returns an array of the key data that should be used when
@@ -145,4 +154,3 @@ module Net; module SSH; module Authentication
       end
   end
 end; end; end
-

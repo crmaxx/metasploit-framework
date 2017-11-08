@@ -1,8 +1,10 @@
-# -*- coding: binary -*-
 require 'net/ssh/loggable'
+require 'net/ssh/ruby_compat'
 require 'net/ssh/connection/channel'
 require 'net/ssh/connection/constants'
 require 'net/ssh/service/forward'
+require 'net/ssh/connection/keepalive'
+require 'net/ssh/connection/event_loop'
 
 module Net; module SSH; module Connection
 
@@ -25,6 +27,9 @@ module Net; module SSH; module Connection
   class Session
     include Constants, Loggable
 
+    # Default IO.select timeout threshold
+    DEFAULT_IO_SELECT_TIMEOUT = 300
+
     # The underlying transport layer abstraction (see Net::SSH::Transport::Session).
     attr_reader :transport
 
@@ -46,9 +51,6 @@ module Net; module SSH; module Connection
 
     # The list of callbacks for pending requests. See #send_global_request.
     attr_reader :pending_requests #:nodoc:
-
-    # when a successful auth is made, note the auth info if session.options[:record_auth_info]
-    attr_accessor :auth_info
 
     class NilChannel
       def initialize(session)
@@ -75,6 +77,14 @@ module Net; module SSH; module Connection
       @channel_open_handlers = {}
       @on_global_request = {}
       @properties = (options[:properties] || {}).dup
+
+      @max_pkt_size = (options.key?(:max_pkt_size) ? options[:max_pkt_size] : 0x8000)
+      @max_win_size = (options.key?(:max_win_size) ? options[:max_win_size] : 0x20000)
+
+      @keepalive = Keepalive.new(self)
+
+      @event_loop = options[:event_loop] || SingleSessionEventLoop.new
+      @event_loop.register(self)
     end
 
     # Retrieves a custom property from this instance. This can be used to
@@ -110,7 +120,11 @@ module Net; module SSH; module Connection
     def close
       info { "closing remaining channels (#{channels.length} open)" }
       channels.each { |id, channel| channel.close }
-      loop { channels.any? }
+      begin
+        loop(0.1) { channels.any? }
+      rescue Net::SSH::Disconnect
+        raise unless channels.empty?
+      end
       transport.close
     end
 
@@ -162,6 +176,15 @@ module Net; module SSH; module Connection
     def loop(wait=nil, &block)
       running = block || Proc.new { busy? }
       loop_forever { break unless process(wait, &running) }
+      begin
+        process(0)
+      rescue IOError => e
+        if e.message =~ /closed/
+          debug { "stream was closed after loop => shallowing exception so it will be re-raised in next loop" }
+        else
+          raise
+        end
+      end
     end
 
     # The core of the event loop. It processes a single iteration of the event
@@ -180,6 +203,8 @@ module Net; module SSH; module Connection
     # This will also cause all active channels to be processed once each (see
     # Net::SSH::Connection::Channel#on_process).
     #
+    # TODO revise example
+    #
     #   # process multiple Net::SSH connections in parallel
     #   connections = [
     #     Net::SSH.start("host1", ...),
@@ -197,13 +222,10 @@ module Net; module SSH; module Connection
     #     break if connections.empty?
     #   end
     def process(wait=nil, &block)
-      return false unless preprocess(&block)
-
-      r = listeners.keys
-      w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
-      readers, writers, = IO.select(r, w, nil, wait)
-
-      postprocess(readers, writers)
+      @event_loop.process(wait, &block)
+    rescue
+      force_channel_cleanup_on_close if closed?
+      raise
     end
 
     # This is called internally as part of #process. It dispatches any
@@ -211,19 +233,38 @@ module Net; module SSH; module Connection
     # for any active channels. If a block is given, it is invoked at the
     # start of the method and again at the end, and if the block ever returns
     # false, this method returns false. Otherwise, it returns true.
-    def preprocess
+    def preprocess(&block)
       return false if block_given? && !yield(self)
-      dispatch_incoming_packets
-      channels.each { |id, channel| channel.process unless channel.closing? }
+      ev_preprocess(&block)
       return false if block_given? && !yield(self)
       return true
     end
 
-    # This is called internally as part of #process. It loops over the given
-    # arrays of reader IO's and writer IO's, processing them as needed, and
+    # Called by event loop to process available data before going to
+    # event multiplexing
+    def ev_preprocess(&block)
+      dispatch_incoming_packets(raise_disconnect_errors: false)
+      each_channel { |id, channel| channel.process unless channel.local_closed? }
+    end
+
+    # Returns the file descriptors the event loop should wait for read/write events,
+    # we also return the max wait
+    def ev_do_calculate_rw_wait(wait)
+      r = listeners.keys
+      w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
+      [r,w,io_select_wait(wait)]
+    end
+
+    # This is called internally as part of #process.
+    def postprocess(readers, writers)
+      ev_do_handle_events(readers, writers)
+    end
+
+    # It loops over the given arrays of reader IO's and writer IO's,
+    # processing them as needed, and
     # then calls Net::SSH::Transport::Session#rekey_as_needed to allow the
     # transport layer to rekey. Then returns true.
-    def postprocess(readers, writers)
+    def ev_do_handle_events(readers, writers)
       Array(readers).each do |reader|
         if listeners[reader]
           listeners[reader].call(reader)
@@ -238,10 +279,14 @@ module Net; module SSH; module Connection
       Array(writers).each do |writer|
         writer.send_pending
       end
+    end
 
+    # calls Net::SSH::Transport::Session#rekey_as_needed to allow the
+    # transport layer to rekey
+    def ev_do_postprocess(was_events)
+      @keepalive.send_as_needed(was_events)
       transport.rekey_as_needed
-
-      return true
+      true
     end
 
     # Send a global request of the given type. The +extra+ parameters must
@@ -289,14 +334,23 @@ module Net; module SSH; module Connection
     #   channel.wait
     def open_channel(type="session", *extra, &on_confirm)
       local_id = get_next_channel_id
-      channel = Channel.new(self, type, local_id, &on_confirm)
 
+      channel = Channel.new(self, type, local_id, @max_pkt_size, @max_win_size, &on_confirm)
       msg = Buffer.from(:byte, CHANNEL_OPEN, :string, type, :long, local_id,
         :long, channel.local_maximum_window_size,
         :long, channel.local_maximum_packet_size, *extra)
       send_message(msg)
 
       channels[local_id] = channel
+    end
+
+    class StringWithExitstatus < String
+      def initialize(str, exitstatus)
+        super(str)
+        @exitstatus = exitstatus
+      end
+
+      attr_reader :exitstatus
     end
 
     # A convenience method for executing a command and interacting with it. If
@@ -319,11 +373,21 @@ module Net; module SSH; module Connection
     #       puts data
     #     end
     #   end
-    def exec(command, &block)
+    def exec(command, status: nil, &block)
       open_channel do |channel|
         channel.exec(command) do |ch, success|
           raise "could not execute command: #{command.inspect}" unless success
-          
+
+          if status
+            channel.on_request("exit-status") do |ch2,data|
+              status[:exit_code] = data.read_long
+            end
+
+            channel.on_request("exit-signal") do |ch2, data|
+              status[:exit_signal] = data.read_long
+            end
+          end
+
           channel.on_data do |ch2, data|
             if block
               block.call(ch2, :stdout, data)
@@ -344,20 +408,26 @@ module Net; module SSH; module Connection
     end
 
     # Same as #exec, except this will block until the command finishes. Also,
-    # if a block is not given, this will return all output (stdout and stderr)
+    # if no block is given, this will return all output (stdout and stderr)
     # as a single string.
     #
     #   matches = ssh.exec!("grep something /some/files")
-    def exec!(command, &block)
-      block ||= Proc.new do |ch, type, data|
+    #
+    # the returned string has an exitstatus method to query it's exit satus
+    def exec!(command, status: nil, &block)
+      block_or_concat = block || Proc.new do |ch, type, data|
         ch[:result] ||= ""
         ch[:result] << data
       end
 
-      channel = exec(command, &block)
+      status ||= {}
+      channel = exec(command, status: status, &block_or_concat)
       channel.wait
 
-      return channel[:result]
+      channel[:result] ||= "" unless block
+      channel[:result] &&= channel[:result].force_encoding("UTF-8") unless block
+
+      StringWithExitstatus.new(channel[:result], status[:exit_code]) if channel[:result]
     end
 
     # Enqueues a message to be sent to the server as soon as the socket is
@@ -387,7 +457,7 @@ module Net; module SSH; module Connection
     #     ch.exec "/some/process/that/wants/input" do |ch, success|
     #       abort "can't execute!" unless success
     #
-    #       io = Rex::Socket::Tcp.create( ... somewhere, ... port ... )
+    #       io = TCPSocket.new(somewhere, port)
     #       io.extend(Net::SSH::BufferedIo)
     #       ssh.listen_to(io)
     #
@@ -446,11 +516,31 @@ module Net; module SSH; module Connection
       old
     end
 
+    def cleanup_channel(channel)
+      if channel.local_closed? and channel.remote_closed?
+        info { "#{host} delete channel #{channel.local_id} which closed locally and remotely" }
+        channels.delete(channel.local_id)
+      end
+    end
+
+    # If the #preprocess and #postprocess callbacks for this session need to run
+    # periodically, this method returns the maximum number of seconds which may
+    # pass between callbacks.
+    def max_select_wait_time
+      @keepalive.interval if @keepalive.enabled?
+    end
+
+
     private
+
+      # iterate channels with the posibility of callbacks opening new channels during the iteration
+      def each_channel(&block)
+        channels.dup.each(&block)
+      end
 
       # Read all pending packets from the connection and dispatch them as
       # appropriate. Returns as soon as there are no more pending packets.
-      def dispatch_incoming_packets
+      def dispatch_incoming_packets(raise_disconnect_errors: true)
         while packet = transport.poll_message
           unless MAP.key?(packet.type)
             raise Net::SSH::Exception, "unexpected response #{packet.type} (#{packet.inspect})"
@@ -458,12 +548,29 @@ module Net; module SSH; module Connection
 
           send(MAP[packet.type], packet)
         end
+      rescue
+        force_channel_cleanup_on_close if closed?
+        raise if raise_disconnect_errors || !$!.is_a?(Net::SSH::Disconnect)
       end
 
       # Returns the next available channel id to be assigned, and increments
       # the counter.
       def get_next_channel_id
         @channel_id_counter += 1
+      end
+
+      def force_channel_cleanup_on_close
+        channels.each do |id, channel|
+          channel_closed(channel)
+        end
+      end
+
+      def channel_closed(channel)
+        channel.remote_closed!
+        channel.close
+
+        cleanup_channel(channel)
+        channel.do_close
       end
 
       # Invoked when a global request is received. The registered global
@@ -506,7 +613,8 @@ module Net; module SSH; module Connection
         info { "channel open #{packet[:channel_type]}" }
 
         local_id = get_next_channel_id
-        channel = Channel.new(self, packet[:channel_type], local_id)
+
+        channel = Channel.new(self, packet[:channel_type], local_id, @max_pkt_size, @max_win_size)
         channel.do_open_confirmation(packet[:remote_id], packet[:window_size], packet[:packet_size])
 
         callback = channel_open_handlers[packet[:channel_type]]
@@ -573,10 +681,7 @@ module Net; module SSH; module Connection
         info { "channel_close: #{packet[:local_id]}" }
 
         channel = channels[packet[:local_id]]
-        channel.close
-
-        channels.delete(packet[:local_id])
-        channel.do_close
+        channel_closed(channel)
       end
 
       def channel_success(packet)
@@ -587,6 +692,10 @@ module Net; module SSH; module Connection
       def channel_failure(packet)
         info { "channel_failure: #{packet[:local_id]}" }
         channels[packet[:local_id]].do_failure
+      end
+
+      def io_select_wait(wait)
+        [wait, max_select_wait_time].compact.min
       end
 
       MAP = Constants.constants.inject({}) do |memo, name|

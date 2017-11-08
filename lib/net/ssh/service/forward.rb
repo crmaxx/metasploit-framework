@@ -1,4 +1,4 @@
-# -*- coding: binary -*-
+# -*- coding: utf-8 -*-
 require 'net/ssh/loggable'
 
 module Net; module SSH; module Service
@@ -28,6 +28,7 @@ module Net; module SSH; module Service
       @remote_forwarded_ports = {}
       @local_forwarded_ports = {}
       @agent_forwarded = false
+      @local_forwarded_sockets = {}
 
       session.on_open_channel('forwarded-tcpip', &method(:forwarded_tcpip))
       session.on_open_channel('auth-agent', &method(:auth_agent_channel))
@@ -47,44 +48,59 @@ module Net; module SSH; module Service
     # If three arguments are given, it is as if the local bind address is
     # "127.0.0.1", and the rest are applied as above.
     #
+    # To request an ephemeral port on the remote server, provide 0 (zero) for
+    # the port number. In all cases, this method will return the port that
+    # has been assigned.
+    #
     #   ssh.forward.local(1234, "www.capify.org", 80)
-    #   ssh.forward.local("0.0.0.0", 1234, "www.capify.org", 80)
+    #   assigned_port = ssh.forward.local("0.0.0.0", 0, "www.capify.org", 80)
     def local(*args)
       if args.length < 3 || args.length > 4
         raise ArgumentError, "expected 3 or 4 parameters, got #{args.length}"
       end
 
-      bind_address = "127.0.0.1"
-      bind_address = args.shift if args.first.is_a?(String) && args.first =~ /\D/
+      local_port_type = :long
 
-      local_port = args.shift.to_i
+      socket = begin
+        if defined?(UNIXServer) and args.first.class == UNIXServer
+          local_port_type = :string
+          args.shift
+        else
+          bind_address = "127.0.0.1"
+          bind_address = args.shift if args.first.is_a?(String) && args.first =~ /\D/
+          local_port = args.shift.to_i
+          local_port_type = :long
+          TCPServer.new(bind_address, local_port)
+        end
+      end
+
+      local_port = socket.addr[1] if local_port == 0 # ephemeral port was requested
       remote_host = args.shift
       remote_port = args.shift.to_i
-
-      socket = TCPServer.new(bind_address, local_port)
 
       @local_forwarded_ports[[local_port, bind_address]] = socket
 
       session.listen_to(socket) do |server|
         client = server.accept
-        debug { "received connection on #{bind_address}:#{local_port}" }
+        debug { "received connection on #{socket}" }
 
-        channel = session.open_channel("direct-tcpip", :string, remote_host, :long, remote_port, :string, bind_address, :long, local_port) do |achannel|
+        channel = session.open_channel("direct-tcpip", :string, remote_host, :long, remote_port, :string, bind_address, local_port_type, local_port) do |achannel|
           achannel.info { "direct channel established" }
         end
 
         prepare_client(client, channel, :local)
-  
+
         channel.on_open_failed do |ch, code, description|
           channel.error { "could not establish direct channel: #{description} (#{code})" }
+          session.stop_listening_to(channel[:socket])
           channel[:socket].close
         end
       end
+
+      local_port
     end
 
-    # Terminates an active local forwarded port. If no such forwarded port
-    # exists, this will raise an exception. Otherwise, the forwarded connection
-    # is terminated.
+    # Terminates an active local forwarded port.
     #
     #   ssh.forward.cancel_local(1234)
     #   ssh.forward.cancel_local(1234, "0.0.0.0")
@@ -103,6 +119,57 @@ module Net; module SSH; module Service
       @local_forwarded_ports.keys
     end
 
+    # Starts listening for connections on the local host, and forwards them
+    # to the specified remote socket via the SSH connection. This will
+    # (re)create the local socket file. The remote server needs to have the
+    # socket file already available.
+    #
+    #   ssh.forward.local_socket('/tmp/local.sock', '/tmp/remote.sock')
+    def local_socket(local_socket_path, remote_socket_path)
+      File.delete(local_socket_path) if File.exist?(local_socket_path)
+      socket = Socket.unix_server_socket(local_socket_path)
+
+      @local_forwarded_sockets[local_socket_path] = socket
+
+      session.listen_to(socket) do |server|
+        client = server.accept[0]
+        debug { "received connection on #{socket}" }
+
+        channel = session.open_channel("direct-streamlocal@openssh.com",
+                                       :string, remote_socket_path,
+                                       :string, nil,
+                                       :long, 0) do |achannel|
+          achannel.info { "direct channel established" }
+        end
+
+        prepare_client(client, channel, :local)
+
+        channel.on_open_failed do |ch, code, description|
+          channel.error { "could not establish direct channel: #{description} (#{code})" }
+          session.stop_listening_to(channel[:socket])
+          channel[:socket].close
+        end
+      end
+
+      local_socket_path
+    end
+
+    # Terminates an active local forwarded socket.
+    #
+    #   ssh.forward.cancel_local_socket('/tmp/foo.sock')
+    def cancel_local_socket(local_socket_path)
+      socket = @local_forwarded_sockets.delete(local_socket_path)
+      socket.shutdown rescue nil
+      socket.close rescue nil
+      session.stop_listening_to(socket)
+    end
+
+    # Returns a list of all active locally forwarded sockets. The returned value
+    # is an array of Unix domain socket file paths.
+    def active_local_sockets
+      @local_forwarded_sockets.keys
+    end
+
     # Requests that all connections on the given remote-port be forwarded via
     # the local host to the given port/host. The last argument describes the
     # bind address on the remote host, and defaults to 127.0.0.1.
@@ -111,20 +178,56 @@ module Net; module SSH; module Service
     # forwarded immediately. If the remote server is not able to begin the
     # listener for this request, an exception will be raised asynchronously.
     #
-    # If you want to know when the connection is active, it will show up in the
-    # #active_remotes list. If you want to block until the port is active, you
-    # could do something like this:
+    # To request an ephemeral port on the remote server, provide 0 (zero) for
+    # the port number. The assigned port will show up in the # #active_remotes
+    # list.
     #
-    #   ssh.forward.remote(80, "www.google.com", 1234, "0.0.0.0")
-    #   ssh.loop { !ssh.forward.active_remotes.include?([1234, "0.0.0.0"]) }
+    # remote_host is interpreted by the server per RFC 4254, which has these
+    # special values:
+    #
+    # - "" means that connections are to be accepted on all protocol
+    #   families supported by the SSH implementation.
+    # - "0.0.0.0" means to listen on all IPv4 addresses.
+    # - "::" means to listen on all IPv6 addresses.
+    # - "localhost" means to listen on all protocol families supported by
+    #   the SSH implementation on loopback addresses only ([RFC3330] and
+    #   [RFC3513]).
+    # - "127.0.0.1" and "::1" indicate listening on the loopback
+    #   interfaces for IPv4 and IPv6, respectively.
+    #
+    # You may pass a block that will be called when the the port forward
+    # request receives a response.  This block will be passed the remote_port
+    # that was actually bound to, or nil if the binding failed.  If the block
+    # returns :no_exception, the "failed binding" exception will not be thrown.
+    #
+    # If you want to block until the port is active, you could do something
+    # like this:
+    #
+    #   got_remote_port = nil
+    #   remote(port, host, remote_port, remote_host) do |actual_remote_port|
+    #     got_remote_port = actual_remote_port || :error
+    #     :no_exception # will yield the exception on my own thread
+    #   end
+    #   session.loop { !got_remote_port }
+    #   if got_remote_port == :error
+    #     raise Net::SSH::Exception, "remote forwarding request failed"
+    #   end
+    #
     def remote(port, host, remote_port, remote_host="127.0.0.1")
       session.send_global_request("tcpip-forward", :string, remote_host, :long, remote_port) do |success, response|
         if success
+          remote_port = response.read_long if remote_port == 0
           debug { "remote forward from remote #{remote_host}:#{remote_port} to #{host}:#{port} established" }
           @remote_forwarded_ports[[remote_port, remote_host]] = Remote.new(host, port)
+          yield remote_port, remote_host if block_given?
         else
-          error { "remote forwarding request failed" }
-          raise Net::SSH::Exception, "remote forwarding request failed"
+          instruction = if block_given?
+            yield :error
+          end
+          unless instruction == :no_exception
+            error { "remote forwarding request failed" }
+            raise Net::SSH::Exception, "remote forwarding request failed"
+          end
         end
       end
     end
@@ -161,6 +264,16 @@ module Net; module SSH; module Service
       @remote_forwarded_ports.keys
     end
 
+    # Returns all active remote forwarded ports and where they forward to. The
+    # returned value is a hash from [<forwarding port on the local host>, <local forwarding address>]
+    # to [<port on the remote host>, <remote bind address>].
+    def active_remote_destinations
+      @remote_forwarded_ports.inject({}) do |result, (remote, local)|
+        result[[local.port, local.host]] = remote
+        result
+      end
+    end
+
     # Enables SSH agent forwarding on the given channel. The forwarded agent
     # will remain active even after the channel closes--the channel is only
     # used as the transport for enabling the forwarded connection. You should
@@ -168,7 +281,7 @@ module Net; module SSH; module Service
     # time a session channel is opened, when the connection was created with
     # :forward_agent set to true:
     #
-    #    Net::SSH.start("remote.host", "me", :forwrd_agent => true) do |ssh|
+    #    Net::SSH.start("remote.host", "me", :forward_agent => true) do |ssh|
     #      ssh.open_channel do |ch|
     #        # agent will be automatically forwarded by this point
     #      end
@@ -200,13 +313,33 @@ module Net; module SSH; module Service
       # and +type+ is an arbitrary string describing the type of the channel.
       def prepare_client(client, channel, type)
         client.extend(Net::SSH::BufferedIo)
+        client.extend(Net::SSH::ForwardedBufferedIo)
         client.logger = logger
 
         session.listen_to(client)
         channel[:socket] = client
 
         channel.on_data do |ch, data|
+          debug { "data:#{data.length} on #{type} forwarded channel" }
           ch[:socket].enqueue(data)
+        end
+
+        channel.on_eof do |ch|
+          debug { "eof #{type} on #{type} forwarded channel" }
+          begin
+            ch[:socket].send_pending
+            ch[:socket].shutdown Socket::SHUT_WR
+          rescue IOError => e
+            if e.message =~ /closed/ then
+              debug { "epipe in on_eof => shallowing exception:#{e}" }
+            else
+              raise
+            end
+          rescue Errno::EPIPE => e
+            debug { "epipe in on_eof => shallowing exception:#{e}" }
+          rescue Errno::ENOTCONN => e
+            debug { "enotconn in on_eof => shallowing exception:#{e}" }
+          end
         end
 
         channel.on_close do |ch|
@@ -215,16 +348,30 @@ module Net; module SSH; module Service
           session.stop_listening_to(ch[:socket])
         end
 
-        channel.on_eof do |ch|
-          ch.close
-        end
-
         channel.on_process do |ch|
           if ch[:socket].closed?
             ch.info { "#{type} forwarded connection closed" }
             ch.close
           elsif ch[:socket].available > 0
             data = ch[:socket].read_available(8192)
+            ch.debug { "read #{data.length} bytes from client, sending over #{type} forwarded connection" }
+            ch.send_data(data)
+          end
+        end
+      end
+
+      # not a real socket, so use a simpler behaviour
+      def prepare_simple_client(client, channel, type)
+        channel[:socket] = client
+
+        channel.on_data do |ch, data|
+          ch.debug { "data:#{data.length} on #{type} forwarded channel" }
+          ch[:socket].send(data)
+        end
+
+        channel.on_process do |ch|
+          data = ch[:socket].read(8192)
+          if data
             ch.debug { "read #{data.length} bytes from client, sending over #{type} forwarded connection" }
             ch.send_data(data)
           end
@@ -246,16 +393,7 @@ module Net; module SSH; module Service
           raise Net::SSH::ChannelOpenFailed.new(1, "unknown request from remote forwarded connection on #{connected_address}:#{connected_port}")
         end
 
-        client = Rex::Socket::Tcp.create(
-          'PeerHost' => remote.host,
-          'PeerPort' => remote.port,
-          'Context'  => {
-             'Msf'        => session.options[:msframework],
-             'MsfExploit' => session.options[:msfmodule]
-          }
-        )
-        session.options[:msfmodule].add_socket(client) if session.options[:msfmodule]
-
+        client = TCPSocket.new(remote.host, remote.port)
         info { "connected #{connected_address}:#{connected_port} originator #{originator_address}:#{originator_port}" }
 
         prepare_client(client, channel, :remote)
@@ -269,8 +407,12 @@ module Net; module SSH; module Service
         channel[:invisible] = true
 
         begin
-          agent = Authentication::Agent.connect(logger)
-          prepare_client(agent.socket, channel, :agent)
+          agent = Authentication::Agent.connect(logger, session.options[:agent_socket_factory])
+          if (agent.socket.is_a? ::IO)
+            prepare_client(agent.socket, channel, :agent)
+          else
+            prepare_simple_client(agent.socket, channel, :agent)
+          end
         rescue Exception => e
           error { "attempted to connect to agent but failed: #{e.class.name} (#{e.message})" }
           raise Net::SSH::ChannelOpenFailed.new(2, "could not connect to authentication agent")

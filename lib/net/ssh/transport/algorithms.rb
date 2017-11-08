@@ -1,4 +1,3 @@
-# -*- coding: binary -*-
 require 'net/ssh/buffer'
 require 'net/ssh/known_hosts'
 require 'net/ssh/loggable'
@@ -7,6 +6,7 @@ require 'net/ssh/transport/constants'
 require 'net/ssh/transport/hmac'
 require 'net/ssh/transport/kex'
 require 'net/ssh/transport/server_version'
+require 'net/ssh/authentication/ed25519_loader'
 
 module Net; module SSH; module Transport
 
@@ -23,16 +23,38 @@ module Net; module SSH; module Transport
     # Define the default algorithms, in order of preference, supported by
     # Net::SSH.
     ALGORITHMS = {
-      :host_key    => %w(ssh-rsa ssh-dss),
-      :kex         => %w(diffie-hellman-group-exchange-sha1
-                         diffie-hellman-group1-sha1),
-      :encryption  => %w(aes128-cbc 3des-cbc blowfish-cbc cast128-cbc
-                         aes192-cbc aes256-cbc rijndael-cbc@lysator.liu.se
-                         idea-cbc none arcfour128 arcfour256),
-      :hmac        => %w(hmac-sha1 hmac-md5 hmac-sha1-96 hmac-md5-96 none),
-      :compression => %w(none zlib@openssh.com zlib),
-      :language    => %w() 
+      host_key: %w(ssh-rsa ssh-dss
+                   ssh-rsa-cert-v01@openssh.com
+                   ssh-rsa-cert-v00@openssh.com),
+      kex: %w(diffie-hellman-group-exchange-sha1
+              diffie-hellman-group1-sha1
+              diffie-hellman-group14-sha1
+              diffie-hellman-group-exchange-sha256),
+      encryption: %w(aes128-cbc 3des-cbc blowfish-cbc cast128-cbc
+                     aes192-cbc aes256-cbc rijndael-cbc@lysator.liu.se
+                     idea-cbc arcfour128 arcfour256 arcfour
+                     aes128-ctr aes192-ctr aes256-ctr
+                     cast128-ctr blowfish-ctr 3des-ctr none),
+
+      hmac: %w(hmac-sha1 hmac-md5 hmac-sha1-96 hmac-md5-96
+               hmac-ripemd160 hmac-ripemd160@openssh.com
+               hmac-sha2-256 hmac-sha2-512 hmac-sha2-256-96
+               hmac-sha2-512-96 none),
+
+      compression: %w(none zlib@openssh.com zlib),
+      language: %w()
     }
+    if defined?(OpenSSL::PKey::EC)
+      ALGORITHMS[:host_key] += %w(ecdsa-sha2-nistp256
+                                  ecdsa-sha2-nistp384
+                                  ecdsa-sha2-nistp521)
+      if Net::SSH::Authentication::ED25519Loader::LOADED
+        ALGORITHMS[:host_key] += %w(ssh-ed25519)
+      end
+      ALGORITHMS[:kex] += %w(ecdh-sha2-nistp256
+                             ecdh-sha2-nistp384
+                             ecdh-sha2-nistp521)
+    end
 
     # The underlying transport layer session that supports this object
     attr_reader :session
@@ -97,6 +119,12 @@ module Net; module SSH; module Transport
       prepare_preferred_algorithms!
     end
 
+    # Start the algorithm negotation
+    def start
+      raise ArgumentError, "Cannot call start if it's negotiation started or done" if @pending || @initialized
+      send_kexinit
+    end
+
     # Request a rekey operation. This will return immediately, and does not
     # actually perform the rekey operation. It does cause the session to change
     # state, however--until the key exchange finishes, no new packets will be
@@ -107,7 +135,7 @@ module Net; module SSH; module Transport
       send_kexinit
     end
 
-    # Called by the transport layer when a KEXINIT packet is recieved, indicating
+    # Called by the transport layer when a KEXINIT packet is received, indicating
     # that the server wants to exchange keys. This can be spontaneous, or it
     # can be in response to a client-initiated rekey request (see #rekey!). Either
     # way, this will block until the key exchange completes.
@@ -183,20 +211,8 @@ module Net; module SSH; module Transport
       def prepare_preferred_algorithms!
         options[:compression] = %w(zlib@openssh.com zlib) if options[:compression] == true
 
-        ALGORITHMS.each do |algorithm, list|
-          algorithms[algorithm] = list.dup
-
-          # apply the preferred algorithm order, if any
-          if options[algorithm]
-            algorithms[algorithm] = Array(options[algorithm]).compact.uniq
-            invalid = algorithms[algorithm].detect { |name| !ALGORITHMS[algorithm].include?(name) }
-            raise NotImplementedError, "unsupported #{algorithm} algorithm: `#{invalid}'" if invalid
-
-            # make sure all of our supported algorithms are tacked onto the
-            # end, so that if the user tries to give a list of which none are
-            # supported, we can still proceed.
-            list.each { |name| algorithms[algorithm] << name unless algorithms[algorithm].include?(name) }
-          end
+        ALGORITHMS.each do |algorithm, supported|
+          algorithms[algorithm] = compose_algorithm_list(supported, options[algorithm], options[:append_all_supported_algorithms])
         end
 
         # for convention, make sure our list has the same keys as the server
@@ -207,11 +223,11 @@ module Net; module SSH; module Transport
         algorithms[:compression_client] = algorithms[:compression_server] = algorithms[:compression]
         algorithms[:language_client   ] = algorithms[:language_server   ] = algorithms[:language]
 
-        if !options.key?(:host_key) and options[:config]
+        if !options.key?(:host_key)
           # make sure the host keys are specified in preference order, where any
           # existing known key for the host has preference.
 
-          existing_keys = KnownHosts.search_for(options[:host_key_alias] || session.host_as_string, options)
+          existing_keys = session.host_keys
           host_keys = existing_keys.map { |key| key.ssh_type }.uniq
           algorithms[:host_key].each do |name|
             host_keys << name unless host_keys.include?(name)
@@ -220,9 +236,41 @@ module Net; module SSH; module Transport
         end
       end
 
+      # Composes the list of algorithms by taking supported algorithms and matching with supplied options.
+      def compose_algorithm_list(supported, option, append_all_supported_algorithms = false)
+        return supported.dup unless option
+
+        list = []
+        option = Array(option).compact.uniq
+
+        if option.first && option.first.start_with?('+')
+          list = supported.dup
+          list << option.first[1..-1]
+          list.concat(option[1..-1])
+          list.uniq!
+        else
+          list = option
+
+          if append_all_supported_algorithms
+            supported.each { |name| list << name unless list.include?(name) }
+          end
+        end
+
+        unsupported = []
+        list.select! do |name|
+          is_supported = supported.include?(name)
+          unsupported << name unless is_supported
+          is_supported
+        end
+
+        lwarn { %(unsupported algorithm: `#{unsupported}') } unless unsupported.empty?
+
+        list
+      end
+
       # Parses a KEXINIT packet from the server.
       def parse_server_algorithm_packet(packet)
-        data = { :raw => packet.content }
+        data = { raw: packet.content }
 
         packet.read(16) # skip the cookie value
 
@@ -240,7 +288,7 @@ module Net; module SSH; module Transport
         # TODO: if first_kex_packet_follows, we need to try to skip the
         # actual kexinit stuff and try to guess what the server is doing...
         # need to read more about this scenario.
-        first_kex_packet_follows = packet.read_bool
+        # first_kex_packet_follows = packet.read_bool
 
         return data
       end
@@ -258,8 +306,8 @@ module Net; module SSH; module Transport
 
         Net::SSH::Buffer.from(:byte, KEXINIT,
           :long, [rand(0xFFFFFFFF), rand(0xFFFFFFFF), rand(0xFFFFFFFF), rand(0xFFFFFFFF)],
-          :string, [kex, host_key, encryption, encryption, hmac, hmac],
-          :string, [compression, compression, language, language],
+          :mstring, [kex, host_key, encryption, encryption, hmac, hmac],
+          :mstring, [compression, compression, language, language],
           :bool, false, :long, 0)
       end
 
@@ -323,12 +371,13 @@ module Net; module SSH; module Transport
         debug { "exchanging keys" }
 
         algorithm = Kex::MAP[kex].new(self, session,
-          :client_version_string => Net::SSH::Transport::ServerVersion::PROTO_VERSION,
-          :server_version_string => session.server_version.version,
-          :server_algorithm_packet => @server_packet,
-          :client_algorithm_packet => @client_packet,
-          :need_bytes => kex_byte_requirement,
-          :logger => logger)
+          client_version_string: Net::SSH::Transport::ServerVersion::PROTO_VERSION,
+          server_version_string: session.server_version.version,
+          server_algorithm_packet: @server_packet,
+          client_algorithm_packet: @client_packet,
+          need_bytes: kex_byte_requirement,
+          minimum_dh_bits: options[:minimum_dh_bits],
+          logger: logger)
         result = algorithm.exchange_keys
 
         secret   = result[:shared_secret].to_ssh
@@ -338,7 +387,7 @@ module Net; module SSH; module Transport
         @session_id ||= hash
 
         key = Proc.new { |salt| digester.digest(secret + hash + salt + @session_id) }
-        
+
         iv_client = key["A"]
         iv_server = key["B"]
         key_client = key["C"]
@@ -346,27 +395,26 @@ module Net; module SSH; module Transport
         mac_key_client = key["E"]
         mac_key_server = key["F"]
 
-        parameters = { :iv => iv_client, :key => key_client, :shared => secret,
-          :hash => hash, :digester => digester }
-        
-        cipher_client = CipherFactory.get(encryption_client, parameters.merge(:encrypt => true))
-        cipher_server = CipherFactory.get(encryption_server, parameters.merge(:iv => iv_server, :key => key_server, :decrypt => true))
+        parameters = { shared: secret, hash: hash, digester: digester }
 
-        mac_client = HMAC.get(hmac_client, mac_key_client)
-        mac_server = HMAC.get(hmac_server, mac_key_server)
+        cipher_client = CipherFactory.get(encryption_client, parameters.merge(iv: iv_client, key: key_client, encrypt: true))
+        cipher_server = CipherFactory.get(encryption_server, parameters.merge(iv: iv_server, key: key_server, decrypt: true))
 
-        session.configure_client :cipher => cipher_client, :hmac => mac_client,
-          :compression => normalize_compression_name(compression_client),
-          :compression_level => options[:compression_level],
-          :rekey_limit => options[:rekey_limit],
-          :max_packets => options[:rekey_packet_limit],
-          :max_blocks => options[:rekey_blocks_limit]
+        mac_client = HMAC.get(hmac_client, mac_key_client, parameters)
+        mac_server = HMAC.get(hmac_server, mac_key_server, parameters)
 
-        session.configure_server :cipher => cipher_server, :hmac => mac_server,
-          :compression => normalize_compression_name(compression_server),
-          :rekey_limit => options[:rekey_limit],
-          :max_packets => options[:rekey_packet_limit],
-          :max_blocks  => options[:rekey_blocks_limit]
+        session.configure_client cipher: cipher_client, hmac: mac_client,
+          compression: normalize_compression_name(compression_client),
+          compression_level: options[:compression_level],
+          rekey_limit: options[:rekey_limit],
+          max_packets: options[:rekey_packet_limit],
+          max_blocks: options[:rekey_blocks_limit]
+
+        session.configure_server cipher: cipher_server, hmac: mac_server,
+          compression: normalize_compression_name(compression_server),
+          rekey_limit: options[:rekey_limit],
+          max_packets: options[:rekey_packet_limit],
+          max_blocks: options[:rekey_blocks_limit]
 
         @initialized = true
       end

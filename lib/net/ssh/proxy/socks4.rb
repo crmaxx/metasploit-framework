@@ -1,5 +1,4 @@
-# -*- coding: binary -*-
-require 'rex/socket'
+require 'socket'
 require 'resolv'
 require 'ipaddr'
 require 'net/ssh/proxy/errors'
@@ -48,19 +47,9 @@ module Net
 
         # Return a new socket connected to the given host and port via the
         # proxy that was requested when the socket factory was instantiated.
-        def open(host, port)
-          socket = Rex::Socket::Tcp.create(
-            'PeerHost' => proxy_host,
-            'PeerPort' => proxy_port,
-            'Context'  => {
-               'Msf'        => options[:msframework],
-               'MsfExploit' => options[:msfmodule]
-            }
-          )
-          # Tell MSF to automatically close this socket on error or completion...
-        # This prevents resource leaks.
-        options[:msfmodule].add_socket(@socket) if options[:msfmodule]
-
+        def open(host, port, connection_options)
+          socket = Socket.tcp(proxy_host, proxy_port, nil, nil,
+                              connect_timeout: connection_options[:timeout])
           ip_addr = IPAddr.new(Resolv.getaddress(host))
           
           packet = [VERSION, CONNECT, port.to_i, ip_addr.to_i, options[:user]].pack("CCnNZ*")

@@ -1,5 +1,4 @@
-# -*- coding: binary -*-
-require 'rex/socket'
+require 'socket'
 require 'net/ssh/proxy/errors'
 
 module Net; module SSH; module Proxy
@@ -9,7 +8,7 @@ module Net; module SSH; module Proxy
   #
   #   require 'net/ssh/proxy/http'
   #
-  #   proxy = Net::SSH::Proxy::HTTP.new('proxy.host', proxy_port)
+  #   proxy = Net::SSH::Proxy::HTTP.new('proxy_host', proxy_port)
   #   Net::SSH.start('host', 'user', :proxy => proxy) do |ssh|
   #     ...
   #   end
@@ -17,7 +16,7 @@ module Net; module SSH; module Proxy
   # If the proxy requires authentication, you can pass :user and :password
   # to the proxy's constructor:
   #
-  #   proxy = Net::SSH::Proxy::HTTP.new('proxy.host', proxy_port,
+  #   proxy = Net::SSH::Proxy::HTTP.new('proxy_host', proxy_port,
   #      :user => "user", :password => "password")
   #
   # Note that HTTP digest authentication is not supported; Basic only at
@@ -49,19 +48,8 @@ module Net; module SSH; module Proxy
 
     # Return a new socket connected to the given host and port via the
     # proxy that was requested when the socket factory was instantiated.
-    def open(host, port)
-      socket = Rex::Socket::Tcp.create(
-        'PeerHost' => proxy_host,
-        'PeerPort' => proxy_port,
-        'Context'  => {
-           'Msf'        => options[:msframework],
-           'MsfExploit' => options[:msfmodule]
-        }
-      )
-      # Tell MSF to automatically close this socket on error or completion...
-    # This prevents resource leaks.
-    options[:msfmodule].add_socket(@socket) if options[:msfmodule]
-
+    def open(host, port, connection_options)
+      socket = establish_connection(connection_options[:timeout])
       socket.write "CONNECT #{host}:#{port} HTTP/1.0\r\n"
 
       if options[:user]
@@ -79,13 +67,18 @@ module Net; module SSH; module Proxy
       raise ConnectError, resp.inspect
     end
 
-    private
+    protected
+
+      def establish_connection(connect_timeout)
+        Socket.tcp(proxy_host, proxy_port, nil, nil,
+                   connect_timeout: connect_timeout)
+      end
 
       def parse_response(socket)
         version, code, reason = socket.gets.chomp.split(/ /, 3)
         headers = {}
 
-        while (line = socket.gets.chomp) != ""
+        while (line = socket.gets) && (line.chomp! != "")
           name, value = line.split(/:/, 2)
           headers[name.strip] = value.strip
         end
@@ -94,13 +87,12 @@ module Net; module SSH; module Proxy
           body = socket.read(headers["Content-Length"].to_i)
         end
 
-        return { :version => version,
-                 :code => code.to_i,
-                 :reason => reason,
-                 :headers => headers,
-                 :body => body }
+        return { version: version,
+                 code: code.to_i,
+                 reason: reason,
+                 headers: headers,
+                 body: body }
       end
-
   end
 
 end; end; end

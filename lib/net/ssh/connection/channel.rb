@@ -1,4 +1,3 @@
-# -*- coding: binary -*-
 require 'net/ssh/loggable'
 require 'net/ssh/connection/constants'
 require 'net/ssh/connection/term'
@@ -108,15 +107,15 @@ module Net; module SSH; module Connection
     # that time (see #do_open_confirmation).
     #
     # This also sets the default maximum packet size and maximum window size.
-    def initialize(connection, type, local_id, &on_confirm_open)
+    def initialize(connection, type, local_id, max_pkt_size = 0x8000, max_win_size = 0x20000, &on_confirm_open)
       self.logger = connection.logger
 
       @connection = connection
       @type       = type
       @local_id   = local_id
 
-      @local_maximum_packet_size = 0x10000
-      @local_window_size = @local_maximum_window_size = 0x20000
+      @local_maximum_packet_size = max_pkt_size
+      @local_window_size = @local_maximum_window_size = max_win_size
 
       @on_confirm_open = on_confirm_open
 
@@ -127,7 +126,7 @@ module Net; module SSH; module Connection
       @pending_requests = []
       @on_open_failed = @on_data = @on_extended_data = @on_process = @on_close = @on_eof = nil
       @on_request = {}
-      @closing = @eof = false
+      @closing = @eof = @sent_eof = @local_closed = @remote_closed = false
     end
 
     # A shortcut for accessing properties of the channel (see #properties).
@@ -190,12 +189,12 @@ module Net; module SSH; module Connection
     end
 
     # A hash of the valid PTY options (see #request_pty).
-    VALID_PTY_OPTIONS = { :term        => "xterm",
-                          :chars_wide  => 80,
-                          :chars_high  => 24,
-                          :pixels_wide => 640,
-                          :pixels_high => 480,
-                          :modes       => {} }
+    VALID_PTY_OPTIONS = { term: "xterm",
+                          chars_wide: 80,
+                          chars_high: 24,
+                          pixels_wide: 640,
+                          pixels_high: 480,
+                          modes: {} }
 
     # Requests that a pseudo-tty (or "pty") be made available for this channel.
     # This is useful when you want to invoke and interact with some kind of
@@ -270,24 +269,33 @@ module Net; module SSH; module Connection
       connection.loop { active? }
     end
 
-    # Returns true if the channel is currently closing, but not actually
-    # closed. A channel is closing when, for instance, #close has been
-    # invoked, but the server has not yet responded with a CHANNEL_CLOSE
-    # packet of its own.
+    # True if close() has been called; NOTE: if the channel has data waiting to
+    # be sent then the channel will close after all the data is sent. See
+    # closed?() to determine if we have actually sent CHANNEL_CLOSE to server.
+    # This may be true for awhile before closed? returns true if we are still
+    # sending buffered output to server.
     def closing?
       @closing
     end
 
-    # Requests that the channel be closed. If the channel is already closing,
-    # this does nothing, nor does it do anything if the channel has not yet
-    # been confirmed open (see #do_open_confirmation). Otherwise, it sends a
-    # CHANNEL_CLOSE message and marks the channel as closing.
+    # True if we have sent CHANNEL_CLOSE to the remote server.
+    def local_closed?
+      @local_closed
+    end
+
+    def remote_closed?
+      @remote_closed
+    end
+
+    def remote_closed!
+      @remote_closed = true
+    end
+
+    # Requests that the channel be closed. It only marks the channel to be closed
+    # the CHANNEL_CLOSE message will be sent from event loop
     def close
       return if @closing
-      if remote_id
-        @closing = true
-        connection.send_message(Buffer.from(:byte, CHANNEL_CLOSE, :long, remote_id))
-      end
+      @closing = true
     end
 
     # Returns true if the local end of the channel has declared that no more
@@ -299,10 +307,10 @@ module Net; module SSH; module Connection
 
     # Tells the remote end of the channel that no more data is forthcoming
     # from this end of the channel. The remote end may still send data.
+    # The CHANNEL_EOF packet will be sent once the output buffer is empty.
     def eof!
       return if eof?
       @eof = true
-      connection.send_message(Buffer.from(:byte, CHANNEL_EOF, :long, remote_id))
     end
 
     # If an #on_process handler has been set up, this will cause it to be
@@ -311,6 +319,17 @@ module Net; module SSH; module Connection
     def process
       @on_process.call(self) if @on_process
       enqueue_pending_output
+
+      if @eof and not @sent_eof and output.empty? and remote_id and not @local_closed
+        connection.send_message(Buffer.from(:byte, CHANNEL_EOF, :long, remote_id))
+        @sent_eof = true
+      end
+
+      if @closing and not @local_closed and output.empty? and remote_id
+        connection.send_message(Buffer.from(:byte, CHANNEL_CLOSE, :long, remote_id))
+        @local_closed = true
+        connection.cleanup_channel(self)
+      end
     end
 
     # Registers a callback to be invoked when data packets are received by the
@@ -431,9 +450,9 @@ module Net; module SSH; module Connection
     #   data, via data.read_string. (Not all SSH servers support this channel
     #   request type.)
     #
-    #   channel.on_request "exit-status" do |ch, data|
-    #     puts "process terminated with exit status: #{data.read_long}"
-    #   end
+    #     channel.on_request "exit-status" do |ch, data|
+    #       puts "process terminated with exit status: #{data.read_long}"
+    #     end
     def on_request(type, &block)
       old, @on_request[type] = @on_request[type], block
       old
@@ -463,6 +482,7 @@ module Net; module SSH; module Connection
     # convenient helper methods (see #exec and #subsystem).
     def send_channel_request(request_name, *data, &callback)
       info { "sending channel request #{request_name.inspect}" }
+      fail "Channel open not yet confirmed, please call send_channel_request(or exec) from block of open_channel" unless remote_id
       msg = Buffer.from(:byte, CHANNEL_REQUEST,
         :long, remote_id, :string, request_name,
         :bool, !callback.nil?, *data)
@@ -506,6 +526,7 @@ module Net; module SSH; module Connection
         @remote_window_size = @remote_maximum_window_size = max_window
         @remote_maximum_packet_size = max_packet
         connection.forward.agent(self) if connection.options[:forward_agent] && type == "session"
+        forward_local_env(connection.options[:send_env]) if connection.options[:send_env]
         @on_confirm_open.call(self) if @on_confirm_open
       end
 
@@ -518,7 +539,7 @@ module Net; module SSH; module Connection
           @on_open_failed.call(self, reason_code, description)
         else
           raise ChannelOpenFailed.new(reason_code, description)
-        end          
+        end
       end
 
       # Invoked when the server sends a CHANNEL_WINDOW_ADJUST packet, and
@@ -592,7 +613,7 @@ module Net; module SSH; module Connection
         if callback = pending_requests.shift
           callback.call(self, false)
         else
-          error { "channel failure recieved with no pending request to handle it (bug?)" }
+          error { "channel failure received with no pending request to handle it (bug?)" }
         end
       end
 
@@ -602,11 +623,17 @@ module Net; module SSH; module Connection
         if callback = pending_requests.shift
           callback.call(self, true)
         else
-          error { "channel success recieved with no pending request to handle it (bug?)" }
+          error { "channel success received with no pending request to handle it (bug?)" }
         end
       end
 
     private
+
+      # Runs the SSH event loop until the remote confirmed channel open
+      # experimental api
+      def wait_until_open_confirmed
+        connection.loop { !remote_id }
+      end
 
       # Updates the local window size by the given amount. If the window
       # size drops to less than half of the local maximum (an arbitrary
@@ -619,6 +646,25 @@ module Net; module SSH; module Connection
             :long, remote_id, :long, 0x20000))
           @local_window_size += 0x20000
           @local_maximum_window_size += 0x20000
+        end
+      end
+
+      # Gets an +Array+ of local environment variables in the remote process'
+      # environment.
+      # A variable name can either be described by a +Regexp+ or +String+.
+      #
+      #   channel.forward_local_env [/^GIT_.*$/, "LANG"]
+      def forward_local_env(env_variable_patterns)
+        Array(env_variable_patterns).each do |env_variable_pattern|
+          matched_variables = ENV.find_all do |env_name, _|
+            case env_variable_pattern
+            when Regexp then env_name =~ env_variable_pattern
+            when String then env_name == env_variable_pattern
+            end
+          end
+          matched_variables.each do |env_name, env_value|
+            self.env(env_name, env_value)
+          end
         end
       end
   end

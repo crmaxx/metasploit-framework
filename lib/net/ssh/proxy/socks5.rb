@@ -1,5 +1,4 @@
-# -*- coding: binary -*-
-require 'rex/socket'
+require 'socket'
 require 'net/ssh/ruby_compat'
 require 'net/ssh/proxy/errors'
 
@@ -63,18 +62,9 @@ module Net
 
         # Return a new socket connected to the given host and port via the
         # proxy that was requested when the socket factory was instantiated.
-        def open(host, port)
-          socket = Rex::Socket::Tcp.create(
-            'PeerHost' => proxy_host,
-            'PeerPort' => proxy_port,
-            'Context'  => {
-               'Msf'        => options[:msframework],
-               'MsfExploit' => options[:msfmodule]
-            }
-          )
-          # Tell MSF to automatically close this socket on error or completion...
-        # This prevents resource leaks.
-        options[:msfmodule].add_socket(@socket) if options[:msfmodule]
+        def open(host, port, connection_options)
+          socket = Socket.tcp(proxy_host, proxy_port, nil, nil,
+                              connect_timeout: connection_options[:timeout])
 
           methods = [METHOD_NO_AUTH]
           methods << METHOD_PASSWD if options[:user]
@@ -105,11 +95,24 @@ module Net
 
           packet << [port].pack("n")
           socket.send packet, 0
-
-          version, reply, = socket.recv(4).unpack("C*")
-          len = socket.recv(1).getbyte(0)
-          socket.recv(len + 2)
-
+          
+          version, reply, = socket.recv(2).unpack("C*")
+          socket.recv(1)
+          address_type = socket.recv(1).getbyte(0)
+          case address_type
+          when 1
+            socket.recv(4)  # get four bytes for IPv4 address
+          when 3
+            len = socket.recv(1).getbyte(0)
+            hostname = socket.recv(len)
+          when 4
+            ipv6addr hostname = socket.recv(16)
+          else
+            socket.close
+            raise ConnectError, "Illegal response type"
+          end
+          portnum = socket.recv(2)
+          
           unless reply == SUCCESS
             socket.close
             raise ConnectError, "#{reply}"

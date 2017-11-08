@@ -1,4 +1,3 @@
-# -*- coding: binary -*-
 require 'net/ssh/errors'
 require 'net/ssh/loggable'
 require 'net/ssh/version'
@@ -16,7 +15,7 @@ module Net; module SSH; module Transport
     include Loggable
 
     # The SSH version string as reported by Net::SSH
-    PROTO_VERSION = "SSH-2.0-OpenSSH_5.0"
+    PROTO_VERSION = "SSH-2.0-Ruby/Net::SSH_#{Net::SSH::Version::CURRENT} #{RUBY_PLATFORM}"
 
     # Any header text sent by the server prior to sending the version.
     attr_reader :header
@@ -26,11 +25,11 @@ module Net; module SSH; module Transport
 
     # Instantiates a new ServerVersion and immediately (and synchronously)
     # negotiates the SSH protocol in effect, using the given socket.
-    def initialize(socket, logger)
+    def initialize(socket, logger, timeout = nil)
       @header = ""
       @version = nil
       @logger = logger
-      negotiate!(socket)
+      negotiate!(socket, timeout)
     end
 
     private
@@ -38,16 +37,24 @@ module Net; module SSH; module Transport
       # Negotiates the SSH protocol to use, via the given socket. If the server
       # reports an incompatible SSH version (e.g., SSH1), this will raise an
       # exception.
-      def negotiate!(socket)
+      def negotiate!(socket, timeout)
         info { "negotiating protocol version" }
 
+        debug { "local is `#{PROTO_VERSION}'" }
+        socket.write "#{PROTO_VERSION}\r\n"
+        socket.flush
+
+        if timeout && !IO.select([socket], nil, nil, timeout)
+          raise Net::SSH::ConnectionTimeout, "timeout during server version negotiating"
+        end
         loop do
           @version = ""
           loop do
-      version_timeout = (9000/1000.0)+3 # (3 to 12 seconds)
-            b = socket.get_once(1,version_timeout)
-            if b.nil?
-              raise Net::SSH::Disconnect, "connection timed out or closed by remote host"
+            begin
+              b = socket.readpartial(1)
+              raise Net::SSH::Disconnect, "connection closed by remote host" if b.nil?
+            rescue EOFError
+              raise Net::SSH::Disconnect, "connection closed by remote host"
             end
             @version << b
             break if b == "\n"
@@ -63,10 +70,9 @@ module Net; module SSH; module Transport
           raise Net::SSH::Exception, "incompatible SSH version `#{@version}'"
         end
 
-        debug { "local is `#{PROTO_VERSION}'" }
-        socket.write "#{PROTO_VERSION}\r\n"
-        socket.flush
+        if timeout && !IO.select(nil, [socket], nil, timeout)
+          raise Net::SSH::ConnectionTimeout, "timeout during client version negotiating"
+        end
       end
   end
 end; end; end
-

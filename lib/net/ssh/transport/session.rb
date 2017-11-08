@@ -1,6 +1,4 @@
-# -*- coding: binary -*-
-require 'rex/socket'
-require 'timeout'
+require 'socket'
 
 require 'net/ssh/errors'
 require 'net/ssh/loggable'
@@ -10,6 +8,7 @@ require 'net/ssh/transport/constants'
 require 'net/ssh/transport/packet_stream'
 require 'net/ssh/transport/server_version'
 require 'net/ssh/verifiers/null'
+require 'net/ssh/verifiers/secure'
 require 'net/ssh/verifiers/strict'
 require 'net/ssh/verifiers/lenient'
 
@@ -59,29 +58,18 @@ module Net; module SSH; module Transport
 
       @host = host
       @port = options[:port] || DEFAULT_PORT
+      @bind_address = options[:bind_address] || nil
       @options = options
 
-      debug { "establishing connection to #{@host}:#{@port}" }
-      factory = options[:proxy]
-
-      if (factory)
-        @socket = timeout(options[:timeout] || 0) { factory.open(@host, @port) }
-      else
-        @socket = timeout(options[:timeout] || 0) {
-          Rex::Socket::Tcp.create(
-          	'PeerHost' => @host,
-          	'PeerPort' => @port,
-            'Proxies' => options[:proxies],
-          	'Context'  => {
-          	  'Msf'          => options[:msframework],
-          	  'MsfExploit'   => options[:msfmodule]
-            }
-          )
-        }
-        # Tell MSF to automatically close this socket on error or completion...
-      # This prevents resource leaks.
-      options[:msfmodule].add_socket(@socket) if options[:msfmodule]
-      end
+      @socket =
+        if (factory = options[:proxy])
+          debug { "establishing connection to #{@host}:#{@port} through proxy" }
+          factory.open(@host, @port, options)
+        else
+          debug { "establishing connection to #{@host}:#{@port}" }
+          Socket.tcp(@host, @port, @bind_address, nil,
+                     connect_timeout: options[:timeout])
+        end
 
       @socket.extend(PacketStream)
       @socket.logger = @logger
@@ -90,12 +78,23 @@ module Net; module SSH; module Transport
 
       @queue = []
 
-      @host_key_verifier = select_host_key_verifier(options[:paranoid])
+      @host_key_verifier = select_host_key_verifier(options[:verify_host_key])
 
-      @server_version = ServerVersion.new(socket, logger)
+
+      @server_version = ServerVersion.new(socket, logger, options[:timeout])
 
       @algorithms = Algorithms.new(self, options)
+      @algorithms.start
       wait { algorithms.initialized? }
+    rescue Errno::ETIMEDOUT
+      raise Net::SSH::ConnectionTimeout
+    end
+
+    def host_keys
+      @host_keys ||= begin
+        known_hosts = options.fetch(:known_hosts, KnownHosts)
+        known_hosts.search_for(options[:host_key_alias] || host_as_string, options)
+      end
     end
 
     # Returns the host (and possibly IP address) in a format compatible with
@@ -104,11 +103,16 @@ module Net; module SSH; module Transport
       @host_as_string ||= begin
         string = "#{host}"
         string = "[#{string}]:#{port}" if port != DEFAULT_PORT
-        if socket.peer_ip != host
-          string2 = socket.peer_ip
+
+        peer_ip = socket.peer_ip
+
+        if peer_ip != Net::SSH::Transport::PacketStream::PROXY_COMMAND_HOST_IP &&
+           peer_ip != host
+          string2 = peer_ip
           string2 = "[#{string2}]:#{port}" if port != DEFAULT_PORT
           string << "," << string2
         end
+
         string
       end
     end
@@ -160,7 +164,7 @@ module Net; module SSH; module Transport
     # Returns a hash of information about the peer (remote) side of the socket,
     # including :ip, :port, :host, and :canonized (see #host_as_string).
     def peer
-      @peer ||= { :ip => socket.peer_ip, :port => @port.to_i, :host => @host, :canonized => host_as_string }
+      @peer ||= { ip: socket.peer_ip, port: @port.to_i, host: @host, canonized: host_as_string }
     end
 
     # Blocks until a new packet is available to be read, and returns that
@@ -194,7 +198,7 @@ module Net; module SSH; module Transport
           raise Net::SSH::Disconnect, "disconnected: #{packet[:description]} (#{packet[:reason_code]})"
 
         when IGNORE
-          debug { "IGNORE packet recieved: #{packet[:data].inspect}" }
+          debug { "IGNORE packet received: #{packet[:data].inspect}" }
 
         when UNIMPLEMENTED
           lwarn { "UNIMPLEMENTED: #{packet[:number]}" }
@@ -273,25 +277,31 @@ module Net; module SSH; module Transport
       # Instantiates a new host-key verification class, based on the value of
       # the parameter. When true or nil, the default Lenient verifier is
       # returned. If it is false, the Null verifier is returned, and if it is
-      # :very, the Strict verifier is returned. If the argument happens to
-      # respond to :verify, it is returned directly. Otherwise, an exception
+      # :very, the Strict verifier is returned. If it is :secure, the even more
+      # strict Secure verifier is returned. If the argument happens to respond
+      # to :verify, it is returned directly. Otherwise, an exception
       # is raised.
-      def select_host_key_verifier(paranoid)
-        case paranoid
+      def select_host_key_verifier(verify_host_key)
+        case verify_host_key
         when true, nil then
           Net::SSH::Verifiers::Lenient.new
         when false then
           Net::SSH::Verifiers::Null.new
         when :very then
           Net::SSH::Verifiers::Strict.new
+        when :secure then
+          Net::SSH::Verifiers::Secure.new
         else
-          if paranoid.respond_to?(:verify)
-            paranoid
+          if verify_host_key.respond_to?(:verify)
+            verify_host_key
           else
-            raise ArgumentError, "argument to :paranoid is not valid: #{paranoid.inspect}"
+            raise(
+              ArgumentError,
+              "Invalid argument to :verify_host_key (or deprecated " \
+              ":paranoid): #{verify_host_key.inspect}"
+            )
           end
         end
       end
   end
 end; end; end
-

@@ -1,4 +1,3 @@
-# -*- coding: binary -*-
 require 'net/ssh/buffer'
 require 'net/ssh/errors'
 require 'net/ssh/loggable'
@@ -41,8 +40,8 @@ module Net; module SSH; module Transport; module Kex
     # required by this algorithm, which was acquired during earlier
     # processing.
     def initialize(algorithms, connection, data)
-      @p = OpenSSL::BN.new(P_s, P_r)
-      @g = G
+      @p = get_p
+      @g = get_g
 
       @digester = OpenSSL::Digest::SHA1
       @algorithms = algorithms
@@ -70,14 +69,22 @@ module Net; module SSH; module Transport; module Kex
       session_id = verify_signature(result)
       confirm_newkeys
 
-      return { :session_id        => session_id, 
-               :server_key        => result[:server_key],
-               :shared_secret     => result[:shared_secret],
-               :hashing_algorithm => digester }
+      return { session_id: session_id,
+               server_key: result[:server_key],
+               shared_secret: result[:shared_secret],
+               hashing_algorithm: digester }
     end
 
     private
-    
+
+      def get_p
+        OpenSSL::BN.new(P_s, P_r)
+      end
+
+      def get_g
+        G
+      end
+
       # Returns the DH key parameters for the current connection.
       def get_parameters
         [p, g]
@@ -108,11 +115,22 @@ module Net; module SSH; module Transport; module Kex
       def generate_key #:nodoc:
         dh = OpenSSL::PKey::DH.new
 
-        dh.p, dh.g = get_parameters
-        dh.priv_key = OpenSSL::BN.rand(data[:need_bytes] * 8)
+        if dh.respond_to?(:set_pqg)
+          p, g = get_parameters
+          dh.set_pqg(p, nil, g)
+        else
+          dh.p, dh.g = get_parameters
+        end
 
-        dh.generate_key! until dh.valid?
-
+        dh.generate_key!
+        until dh.valid? && dh.priv_key.num_bytes == data[:need_bytes]
+          if dh.respond_to?(:set_key)
+            dh.set_key(nil, OpenSSL::BN.rand(data[:need_bytes] * 8))
+          else
+            dh.priv_key = OpenSSL::BN.rand(data[:need_bytes] * 8)
+          end
+          dh.generate_key!
+        end
         dh
       end
 
@@ -163,7 +181,7 @@ module Net; module SSH; module Transport; module Kex
 
         blob, fingerprint = generate_key_fingerprint(key)
 
-        unless connection.host_key_verifier.verify(:key => key, :key_blob => blob, :fingerprint => fingerprint, :session => connection)
+        unless connection.host_key_verifier.verify(key: key, key_blob: blob, fingerprint: fingerprint, session: connection)
           raise Net::SSH::Exception, "host key verification failed"
         end
       end

@@ -1,10 +1,11 @@
-# -*- coding: binary -*-
 require 'net/ssh/buffered_io'
 require 'net/ssh/errors'
 require 'net/ssh/packet'
+require 'net/ssh/ruby_compat'
 require 'net/ssh/transport/cipher_factory'
 require 'net/ssh/transport/hmac'
 require 'net/ssh/transport/state'
+
 
 module Net; module SSH; module Transport
 
@@ -13,6 +14,8 @@ module Net; module SSH; module Transport
   # per the SSH2 protocol. It also adds an abstraction for polling packets,
   # to allow for both blocking and non-blocking reads.
   module PacketStream
+    PROXY_COMMAND_HOST_IP = '<no hostip for proxy command>'.freeze
+
     include BufferedIo
 
     def self.extended(object)
@@ -56,14 +59,20 @@ module Net; module SSH; module Transport
     end
 
     # The IP address of the peer (remote) end of the socket, as reported by
-    # the Rex socket.
+    # the socket.
     def peer_ip
-    @peer_ip ||= getpeername[1]
-  end
+      @peer_ip ||=
+        if respond_to?(:getpeername)
+          addr = getpeername
+          Socket.getnameinfo(addr, Socket::NI_NUMERICHOST | Socket::NI_NUMERICSERV).first
+        else
+          PROXY_COMMAND_HOST_IP
+        end
+    end
 
     # Returns true if the IO is available for reading, and false otherwise.
     def available_for_read?
-      result = IO.select([self], nil, nil, 0)
+      result = Net::SSH::Compat.io_select([self], nil, nil, 0)
       result && result.first.any?
     end
 
@@ -75,7 +84,19 @@ module Net; module SSH; module Transport
     def next_packet(mode=:nonblock)
       case mode
       when :nonblock then
-        fill if available_for_read?
+        packet = poll_next_packet
+        return packet if packet
+
+        if available_for_read?
+          if fill <= 0
+            result = poll_next_packet
+            if result.nil?
+              raise Net::SSH::Disconnect, "connection closed by remote host"
+            else
+              return result
+            end
+          end
+        end
         poll_next_packet
 
       when :block then
@@ -84,7 +105,7 @@ module Net; module SSH; module Transport
           return packet if packet
 
           loop do
-            result = IO.select([self]) or next
+            result = Net::SSH::Compat.io_select([self]) or next
             break if result.first.any?
           end
 
@@ -113,18 +134,18 @@ module Net; module SSH; module Transport
       payload = client.compress(payload)
 
       # the length of the packet, minus the padding
-      actual_length = 4 + payload.length + 1
+      actual_length = 4 + payload.bytesize + 1
 
       # compute the padding length
       padding_length = client.block_size - (actual_length % client.block_size)
       padding_length += client.block_size if padding_length < 4
 
       # compute the packet length (sans the length field itself)
-      packet_length = payload.length + padding_length + 1
+      packet_length = payload.bytesize + padding_length + 1
 
       if packet_length < 16
         padding_length += client.block_size
-        packet_length = payload.length + padding_length + 1
+        packet_length = payload.bytesize + padding_length + 1
       end
 
       padding = Array.new(padding_length) { rand(256) }.pack("C*")
@@ -208,7 +229,6 @@ module Net; module SSH; module Transport
         padding_length = @packet.read_byte
 
         payload = @packet.read(@packet_length - padding_length - 1)
-        padding = @packet.read(padding_length) if padding_length > 0
 
         my_computed_hmac = server.hmac.digest([server.sequence_number, @packet.content].pack("NA*"))
         raise Net::SSH::Exception, "corrupted mac detected" if real_hmac != my_computed_hmac

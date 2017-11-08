@@ -1,4 +1,3 @@
-# -*- coding: binary -*-
 require 'net/ssh/transport/session'
 require 'net/ssh/connection/session'
 require 'net/ssh/test/kex'
@@ -11,10 +10,10 @@ module Net; module SSH
   # typically include this module in your unit test class, and then build a
   # "story" of expected sends and receives:
   #
-  #   require 'test/unit'
+  #   require 'minitest/autorun'
   #   require 'net/ssh/test'
   #
-  #   class MyTest < Test::Unit::TestCase
+  #   class MyTest < Minitest::Test
   #     include Net::SSH::Test
   #
   #     def test_exec_via_channel_works
@@ -51,7 +50,7 @@ module Net; module SSH
     # If a block is given, yields the script for the test socket (#socket).
     # Otherwise, simply returns the socket's script. See Net::SSH::Test::Script.
     def story
-      yield socket.script if block_given?
+      Net::SSH::Test::Extensions::IO.with_test_extension { yield socket.script if block_given? }
       return socket.script
     end
 
@@ -72,7 +71,10 @@ module Net; module SSH
     # in these tests. It is a fully functional SSH transport session, operating
     # over a mock socket (#socket).
     def transport(options={})
-      @transport ||= Net::SSH::Transport::Session.new(options[:host] || "localhost", options.merge(:kex => "test", :host_key => "ssh-rsa", :paranoid => false, :proxy => socket(options)))
+      @transport ||= Net::SSH::Transport::Session.new(
+        options[:host] || "localhost",
+        options.merge(kex: "test", host_key: "ssh-rsa", verify_host_key: false, proxy: socket(options))
+      )
     end
 
     # First asserts that a story has been described (see #story). Then yields,
@@ -82,7 +84,7 @@ module Net; module SSH
     # the block passed to this assertion.
     def assert_scripted
       raise "there is no script to be processed" if socket.script.events.empty?
-      yield
+      Net::SSH::Test::Extensions::IO.with_test_extension { yield }
       assert socket.script.events.empty?, "there should not be any remaining scripted events, but there are still #{socket.script.events.length} pending"
     end
   end

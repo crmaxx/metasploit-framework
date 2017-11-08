@@ -1,4 +1,3 @@
-# -*- coding: binary -*-
 module Net; module SSH
   # A general exception class, to act as the ancestor of all other Net::SSH
   # exception classes.
@@ -6,25 +5,32 @@ module Net; module SSH
 
   # This exception is raised when authentication fails (whether it be
   # public key authentication, password authentication, or whatever).
-  class AuthenticationFailed < Exception; end
+  class AuthenticationFailed < Net::SSH::Exception; end
+
+  # This exception is raised when a connection attempt times out.
+  class ConnectionTimeout < Net::SSH::Exception; end
 
   # This exception is raised when the remote host has disconnected
   # unexpectedly.
-  class Disconnect < Exception; end
+  class Disconnect < Net::SSH::Exception; end
+
+  # This exception is raised when the remote host has disconnected/
+  # timeouted unexpectedly.
+  class Timeout < Disconnect; end
 
   # This exception is primarily used internally, but if you have a channel
   # request handler (see Net::SSH::Connection::Channel#on_request) that you
   # want to fail in such a way that the server knows it failed, you can
   # raise this exception in the handler and Net::SSH will translate that into
   # a "channel failure" message.
-  class ChannelRequestFailed < Exception; end
+  class ChannelRequestFailed < Net::SSH::Exception; end
 
   # This is exception is primarily used internally, but if you have a channel
   # open handler (see Net::SSH::Connection::Session#on_open_channel) and you
   # want to fail in such a way that the server knows it failed, you can
   # raise this exception in the handler and Net::SSH will translate that into
   # a "channel open failed" message.
-  class ChannelOpenFailed < Exception
+  class ChannelOpenFailed < Net::SSH::Exception
     attr_reader :code, :reason
 
     def initialize(code, reason)
@@ -33,12 +39,10 @@ module Net; module SSH
     end
   end
 
-  # Raised when the cached key for a particular host does not match the
-  # key given by the host, which can be indicative of a man-in-the-middle
-  # attack. When rescuing this exception, you can inspect the key fingerprint
-  # and, if you want to proceed anyway, simply call the remember_host!
-  # method on the exception, and then retry.
-  class HostKeyMismatch < Exception
+  # Base class for host key exceptions. When rescuing this exception, you can
+  # inspect the key fingerprint and, if you want to proceed anyway, simply call
+  # the remember_host! method on the exception, and then retry.
+  class HostKeyError < Net::SSH::Exception
     # the callback to use when #remember_host! is called
     attr_writer :callback #:nodoc:
 
@@ -83,4 +87,18 @@ module Net; module SSH
       @callback.call
     end
   end
+
+  # Raised when the cached key for a particular host does not match the
+  # key given by the host, which can be indicative of a man-in-the-middle
+  # attack. When rescuing this exception, you can inspect the key fingerprint
+  # and, if you want to proceed anyway, simply call the remember_host!
+  # method on the exception, and then retry.
+  class HostKeyMismatch < HostKeyError; end
+
+  # Raised when there is no cached key for a particular host, which probably
+  # means that the host has simply not been seen before.
+  # When rescuing this exception, you can inspect the key fingerprint and, if
+  # you want to proceed anyway, simply call the remember_host! method on the
+  # exception, and then retry.
+  class HostKeyUnknown < HostKeyError; end
 end; end

@@ -1,5 +1,4 @@
-# -*- coding: binary -*-
-require 'rex/socket'
+require 'socket'
 require 'stringio'
 require 'net/ssh/test/extensions'
 require 'net/ssh/test/script'
@@ -26,8 +25,8 @@ module Net; module SSH; module Test
 
       @script = Script.new
 
-      script.gets(:kexinit, 1, 2, 3, 4, "test", "ssh-rsa", "none", "none", "none", "none", "none", "none", "", "", false)
       script.sends(:kexinit)
+      script.gets(:kexinit, 1, 2, 3, 4, "test", "ssh-rsa", "none", "none", "none", "none", "none", "none", "", "", false)
       script.sends(:newkeys)
       script.gets(:newkeys)
     end
@@ -40,7 +39,7 @@ module Net; module SSH; module Test
 
     # Allows the socket to also mimic a socket factory, simply returning
     # +self+.
-    def open(host, port)
+    def open(host, port, options={})
       @host, @port = host, port
       self
     end
@@ -55,6 +54,11 @@ module Net; module SSH; module Test
     def recv(n)
       read(n) || ""
     end
+
+    def readpartial(n)
+      recv(n)
+    end
+    
   end
 
 end; end; end
